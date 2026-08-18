@@ -129,9 +129,20 @@ pub fn check(
     })
 }
 
-/// Independently rerun an [`ConsistencyOutcome::ExtensionFailed`] claim: reconstruct the
-/// carried proof and confirm it does **not** establish consistency between `retained_root`
-/// and `offered_root`.
+/// Independently rerun an [`ConsistencyOutcome::ExtensionFailed`] claim.
+///
+/// Confirms the carried proof is bound to *this* pair — `evidence.from_size ==
+/// retained.tree_size` and `evidence.to_size == offered.tree_size` — and, only then, that
+/// replaying it does **not** establish consistency between `retained.root_hash` and
+/// `offered.root_hash`.
+///
+/// `extension-failed` means precisely **"the carried purported extension proof fails
+/// verification"** — nothing more. It is not, and MUST NOT be read as, proof that no valid
+/// extension exists between `retained` and `offered`: a witness can show that one specific
+/// proof fails, never that every proof would. The size check exists because, without it, a
+/// structurally valid failing proof for some *unrelated* pair of sizes would satisfy the
+/// replay below and wrongly validate a refusal about `retained`/`offered` — the proof MUST be
+/// about the pair the refusal names, not merely well-formed on its own.
 ///
 /// This is exactly what a verifier holding only the refusal evidence (not this crate's
 /// internal state) can and should do to check an `extension-failed` reason for themselves —
@@ -143,11 +154,14 @@ pub fn check(
 /// structure itself is invalid (e.g. a path length inconsistent with `from_size`/`to_size`).
 pub fn verify_extension_failure(
     evidence: &ConsistencyProofEvidence,
-    retained_root_hash: &str,
-    offered_root_hash: &str,
+    retained: &Checkpoint,
+    offered: &Checkpoint,
 ) -> WitnessResult<bool> {
-    let retained_root: Hash = ahl_core::parse_hash_hex(retained_root_hash)?;
-    let offered_root: Hash = ahl_core::parse_hash_hex(offered_root_hash)?;
+    if evidence.from_size != retained.tree_size || evidence.to_size != offered.tree_size {
+        return Ok(false);
+    }
+    let retained_root: Hash = ahl_core::parse_hash_hex(&retained.root_hash)?;
+    let offered_root: Hash = ahl_core::parse_hash_hex(&offered.root_hash)?;
     let proof = evidence.to_atl()?;
     Ok(!verify_consistency(&proof, &retained_root, &offered_root)?)
 }
@@ -196,18 +210,39 @@ mod tests {
         };
         assert_eq!(evidence.from_size, 4);
         assert_eq!(evidence.to_size, 8);
-        // A verifier holding only this evidence and the two root hashes can rerun the check.
-        assert!(verify_extension_failure(&evidence, &retained.root_hash, &offered.root_hash)
-            .expect("well-formed proof"));
+        // A verifier holding only this evidence and the two checkpoints can rerun the check.
+        assert!(
+            verify_extension_failure(&evidence, &retained, &offered).expect("well-formed proof")
+        );
         // And confirm it does NOT also "fail" a genuine, unrelated consistent pair — i.e.
         // the replay is a real check, not a rubber stamp.
         let genuine_offered = cp(8, atl_core::core::merkle::compute_root(&leaves[..8]));
-        assert!(!verify_extension_failure(
-            &evidence,
-            &retained.root_hash,
-            &genuine_offered.root_hash
-        )
-        .expect("well-formed proof"));
+        assert!(!verify_extension_failure(&evidence, &retained, &genuine_offered)
+            .expect("well-formed proof"));
+    }
+
+    #[test]
+    fn a_proof_for_an_unrelated_pair_of_sizes_does_not_validate_this_refusal() {
+        // The defect this test guards against: a structurally valid *failing* proof for some
+        // other (from_size, to_size) pair must not be accepted as evidence for a refusal
+        // about `retained`/`offered` just because replaying it also returns "inconsistent".
+        // The proof's own from_size/to_size MUST equal retained.tree_size/offered.tree_size.
+        let leaves: Vec<Hash> = (0u8..8).map(leaf).collect();
+        let unrelated_retained = cp(2, atl_core::core::merkle::compute_root(&leaves[..2]));
+        let mut unrelated_offered = cp(6, atl_core::core::merkle::compute_root(&leaves[..6]));
+        unrelated_offered.root_hash = format!("sha256:{}", "ff".repeat(32));
+        let outcome = check(&unrelated_retained, &unrelated_offered, &leaves).expect("well-formed");
+        let ConsistencyOutcome::ExtensionFailed(evidence) = outcome else {
+            panic!("expected ExtensionFailed");
+        };
+        assert_eq!(evidence.from_size, 2);
+        assert_eq!(evidence.to_size, 6);
+
+        // A genuinely different pair, sharing neither size with the evidence above.
+        let retained = cp(4, atl_core::core::merkle::compute_root(&leaves[..4]));
+        let offered = cp(8, atl_core::core::merkle::compute_root(&leaves[..8]));
+        assert!(!verify_extension_failure(&evidence, &retained, &offered)
+            .expect("size mismatch is a clean false, not an error"));
     }
 
     #[test]
@@ -277,6 +312,8 @@ mod tests {
             to_size: 2,
             path: vec!["not-a-hash".to_owned()],
         };
-        assert!(verify_extension_failure(&evidence, "sha256:aa", "sha256:bb").is_err());
+        let retained = cp(1, [0u8; 32]);
+        let offered = cp(2, [0u8; 32]);
+        assert!(verify_extension_failure(&evidence, &retained, &offered).is_err());
     }
 }

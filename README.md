@@ -146,10 +146,18 @@ three members meeting that bar — this is the taxonomy the adaptor profile is e
 | --- | --- | --- |
 | `equivocation` | `retained`/`offered` share a `tree_size` with different `root_hash` — found either at the offered size directly, or cited again (with the *original* pair) for every later candidate while the log's floor stands | `retained.tree_size == offered.tree_size && retained.root_hash != offered.root_hash` |
 | `size-regression` | `offered.tree_size` is smaller than an already-cosigned size, with no history entry at the offered size itself | `offered.tree_size < retained.tree_size` |
-| `extension-failed` | `offered.tree_size > retained.tree_size` and a consistency proof was generated but does not verify | reconstruct the carried `consistency_proof` and rerun RFC 9162 verification against the two carried roots (`consistency::verify_extension_failure`) |
+| `extension-failed` | `offered.tree_size > retained.tree_size` and the carried purported extension proof fails verification | confirm `consistency_proof.from_size`/`to_size` equal `retained.tree_size`/`offered.tree_size` — a structurally valid failing proof for an *unrelated* pair of sizes MUST NOT validate this refusal — then rerun RFC 9162 verification against the two carried roots (`consistency::verify_extension_failure`) |
+
+`extension-failed` means precisely **"the carried purported extension proof fails
+verification"** — nothing more. It does not mean, and MUST NOT be described as, proof that no
+valid extension exists between `retained` and `offered`: a witness can show one specific proof
+fails, never that every proof would.
 
 `witness::verify_refusal_claim` implements exactly this table and is unit-tested for all three
-reasons, including a genuine replay of a carried `extension-failed` proof.
+reasons, including a genuine replay of a carried `extension-failed` proof and a negative test
+(`a_proof_for_an_unrelated_pair_of_sizes_does_not_validate_this_refusal`) confirming a
+well-formed, genuinely-failing proof carrying the *wrong* sizes is rejected as evidence rather
+than accepted.
 
 Adaptor profile §11.2's `missing-consistency-proof` reason is **deliberately not part of this
 taxonomy**. It is written as though a consistency proof is handed to the witness and can simply
@@ -242,7 +250,7 @@ checkpoint C only with a valid witness cosignature").
 
 ## Specification questions raised, and how core spec settled them
 
-Two rounds of review against this crate produced core-spec clarifications; recording both what
+Three rounds of review against this crate produced core-spec clarifications; recording both what
 was asked and how it was resolved, rather than only the final state, since the earlier rounds'
 reasoning is what a future spec reader needs to know a question was ever open.
 
@@ -289,6 +297,19 @@ reasoning is what a future spec reader needs to know a question was ever open.
   alone. Core spec §3.3 now requires every reason to be independently checkable and forbids
   emitting one whose verification procedure is undefined. See "Refusal reason taxonomy" above for
   the three-reason replacement this crate defines and proposes back to the profile.
+- **`extension-failed` evidence was not bound to the pair it claimed to be about — a real
+  defect, fixed.** `verify_refusal_claim` checked only that `offered.tree_size >
+  retained.tree_size`, then delegated to a replay function that verified the carried proof
+  using the proof's *own* `from_size`/`to_size` — never checked against `retained.tree_size`/
+  `offered.tree_size`. A structurally valid, genuinely failing proof for some unrelated pair of
+  sizes therefore validated a refusal about a completely different pair. Fixed by requiring
+  `consistency::verify_extension_failure` to check `evidence.from_size == retained.tree_size`
+  and `evidence.to_size == offered.tree_size` before replaying anything, returning a clean
+  `false` (not an error) on mismatch — see "Refusal reason taxonomy" above and
+  `consistency::tests::a_proof_for_an_unrelated_pair_of_sizes_does_not_validate_this_refusal`.
+  This round also fixed the wording: `extension-failed` means precisely "the carried purported
+  extension proof fails verification," never "no valid extension exists" — a witness showing
+  one proof fails never establishes that every proof would.
 
 ## Quality bar
 

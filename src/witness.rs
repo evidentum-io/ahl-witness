@@ -61,7 +61,12 @@
 //! | --- | --- | --- |
 //! | `equivocation` | `retained`/`offered` share a `tree_size` with different `root_hash` (found either at the offered size directly, or — once found once — cited again for every later candidate while the log's floor stands) | `retained.tree_size == offered.tree_size && retained.root_hash != offered.root_hash` |
 //! | `size-regression` | `offered.tree_size` is smaller than an already-cosigned size, and no history entry exists at the offered size itself | `offered.tree_size < retained.tree_size` |
-//! | `extension-failed` | `offered.tree_size > retained.tree_size` and a consistency proof was generated but does not verify | reconstruct `consistency_proof` and rerun RFC 9162 verification against the two carried roots — see [`crate::consistency::verify_extension_failure`] |
+//! | `extension-failed` | `offered.tree_size > retained.tree_size` and the carried purported extension proof fails verification | confirm `consistency_proof.from_size`/`to_size` equal `retained.tree_size`/`offered.tree_size` (a proof for an unrelated pair MUST NOT validate this refusal), then rerun RFC 9162 verification against the two carried roots — see [`crate::consistency::verify_extension_failure`] |
+//!
+//! `extension-failed` means precisely **"the carried purported extension proof fails
+//! verification"** — nothing more. It is not, and MUST NOT be described as, proof that no
+//! valid extension exists between `retained` and `offered`: a single failing proof never
+//! establishes that no other proof would succeed.
 //!
 //! `missing-consistency-proof` (adaptor profile §11.2's other named reason) is deliberately
 //! **not** part of this taxonomy: this crate always supplies the complete
@@ -375,14 +380,10 @@ pub fn verify_refusal_claim(evidence: &RefusalEvidence) -> WitnessResult<bool> {
         }
         RefusalReason::ExtensionFailed => {
             let Some(proof) = &evidence.consistency_proof else { return Ok(false) };
-            if evidence.offered.tree_size <= evidence.retained.tree_size {
-                return Ok(false);
-            }
-            consistency::verify_extension_failure(
-                proof,
-                &evidence.retained.root_hash,
-                &evidence.offered.root_hash,
-            )
+            // `verify_extension_failure` itself binds `proof.from_size`/`proof.to_size` to
+            // `retained.tree_size`/`offered.tree_size` before replaying anything, so a proof
+            // for an unrelated pair of sizes cannot validate this refusal.
+            consistency::verify_extension_failure(proof, &evidence.retained, &evidence.offered)
         }
     }
 }

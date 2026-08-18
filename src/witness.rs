@@ -11,6 +11,30 @@
 //!    a finding.
 //! ```
 //!
+//! Core spec §3.3 also states, normatively, the **"obligations that make the machine
+//! sound"** this module is built around (commit `92f8fc4`):
+//!
+//! - **Compare against the whole retained history, not the newest member.** An offered
+//!   checkpoint whose `(log_id, tree_size)` matches one already cosigned with a different
+//!   `root_hash` is equivocation, whatever its size relative to the newest retained member.
+//!   [`witness_checkpoint`] queries the crate-private `store::find_cosigned_at_size` for the
+//!   *exact* offered size, every time, before falling back to comparing against only the
+//!   latest retained checkpoint.
+//! - **Serialize and make atomic.** The retain–verify–classify–cosign transition MUST be
+//!   serialized per log and atomic; state MUST be re-read inside the critical section, and an
+//!   equivocation record MUST be persisted in the same atomic step as the refusal it
+//!   justifies. See the crate-private `Store::with_lock` and the module docs of
+//!   [`crate::store`].
+//! - **Equivocation is permanent for that log.** A later well-formed checkpoint does not
+//!   clear an equivocation record, and cosigning MUST NOT resume past a recorded floor.
+//! - **Every refusal reason MUST be independently checkable** from the evidence it carries; a
+//!   reason whose verification procedure is undefined MUST NOT be emitted. See "Refusal
+//!   reason taxonomy" below and [`verify_refusal_claim`].
+//! - **Grace resolves like cadence**: `witness_grace_period` is taken from the manifest
+//!   version governing the checkpoint in question, never the newest version — this crate
+//!   already stores cadence and grace alongside each cosigned checkpoint at cosign time (see
+//!   [`crate::store::RetainedCheckpoint`]), which is exactly this rule.
+//!
 //! # Authentication failures are not refusal evidence
 //!
 //! Adaptor profile §11.2 rule 2 requires refusal evidence to carry **two validly signed**
@@ -19,39 +43,47 @@
 //! does not verify, a key used outside its validity window — is therefore not a "checkpoint
 //! the log offered" in the protocol's sense; there is nothing to pair it with in refusal
 //! evidence, and [`witness_checkpoint`] reports it as an ordinary [`WitnessError`] instead.
-//! [`ConsistencyOutcome`] failures, by contrast, only ever arise between two checkpoints that
-//! have both already authenticated, and always produce [`WitnessOutcome::Refused`].
 //!
-//! # Equivocation ends the series (core spec §7.3)
+//! # Bootstrap refusal carries no evidence (core spec §3.3, confirmed)
 //!
-//! Two authenticated checkpoints sharing a `tree_size` with differing `root_hash` values are
-//! **equivocation, not a tie**: "From the lowest `tree_size` at which it occurs, the series
-//! is no longer canonical: no incorporation bound, enumeration response or completeness
-//! claim may be grounded at or beyond that point, and a party serving series-dependent
-//! material MUST report the divergence rather than choosing a branch. … Detecting
-//! equivocation and then continuing to serve one branch is a conformance violation." This is
-//! a stronger requirement than "refuse this one candidate": once [`consistency::check`]
-//! reports [`ConsistencyOutcome::Equivocation`] for a log, [`witness_checkpoint`] records an
-//! **equivocation floor** for it ([`Store::record_equivocation`]) and every subsequent call
-//! for that log — regardless of the new candidate's own validity — is refused without
-//! attempting ordinary consistency checking, so no later checkpoint can be cosigned in a way
-//! that would make either conflicting branch look canonical again. [`published_checkpoint`]
-//! is the read-side counterpart: once a log has an equivocation floor, it reports
-//! [`PublishedCheckpoint::Equivocated`] instead of any specific "latest" checkpoint, however
-//! validly that checkpoint was itself cosigned before the divergence was found.
+//! "Before a first checkpoint is retained there is no partner to pair with, so a refusal at
+//! bootstrap carries no two-checkpoint evidence and MUST be reported as such rather than
+//! fabricating a partner." [`witness_checkpoint`] reports a bad first checkpoint as
+//! [`WitnessError::CheckpointRootMismatch`] — a hard error, not [`WitnessOutcome::Refused`] —
+//! for exactly this reason.
+//!
+//! # Refusal reason taxonomy
+//!
+//! [`RefusalReason`] has exactly three members, each independently checkable from the
+//! evidence its refusal carries without trusting this witness's classification:
+//!
+//! | reason | when | what a verifier rechecks |
+//! | --- | --- | --- |
+//! | `equivocation` | `retained`/`offered` share a `tree_size` with different `root_hash` (found either at the offered size directly, or — once found once — cited again for every later candidate while the log's floor stands) | `retained.tree_size == offered.tree_size && retained.root_hash != offered.root_hash` |
+//! | `size-regression` | `offered.tree_size` is smaller than an already-cosigned size, and no history entry exists at the offered size itself | `offered.tree_size < retained.tree_size` |
+//! | `extension-failed` | `offered.tree_size > retained.tree_size` and a consistency proof was generated but does not verify | reconstruct `consistency_proof` and rerun RFC 9162 verification against the two carried roots — see [`crate::consistency::verify_extension_failure`] |
+//!
+//! `missing-consistency-proof` (adaptor profile §11.2's other named reason) is deliberately
+//! **not** part of this taxonomy: this crate always supplies the complete
+//! `[0, offered.tree_size)` entry range before classifying anything (adaptor profile §10.6),
+//! so a consistency proof between two sizes it already holds can only fail to *generate* for
+//! reasons that are not claims about the log's checkpoints and are therefore not
+//! independently checkable from carried evidence — see [`crate::consistency`]'s module docs.
+//! Such a failure is propagated as a [`WitnessError`], not emitted as a refusal reason.
 
 use atl_core::core::merkle::{compute_root, Hash};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::checkpoint::{verify_checkpoint_signature, Checkpoint};
 use crate::config::{LogAnchor, WitnessSigner};
-use crate::consistency::{self, ConsistencyOutcome};
+use crate::consistency::{self, ConsistencyOutcome, ConsistencyProofEvidence};
 use crate::error::{WitnessError, WitnessResult};
 use crate::governance::{self, GovernanceState};
 use crate::metadata::log_leaf_hash;
-use crate::store::{RetainedCheckpoint, Store};
+use crate::store::{self, Store};
 
 /// A checkpoint this witness has cosigned (adaptor profile §11.1).
 ///
@@ -75,16 +107,19 @@ pub struct CosignedCheckpoint {
     pub cosigned_at: String,
 }
 
-/// Why a witness refused to cosign (adaptor profile §11.2).
+/// Why a witness refused to cosign. See the module docs, "Refusal reason taxonomy", for what
+/// each variant means and how a verifier independently rechecks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RefusalReason {
-    /// Two checkpoints of the same log with an incompatible history — including the
-    /// equal-`tree_size`, different-`root_hash` case adaptor profile §11.2 names explicitly.
-    Inconsistent,
-    /// An offered checkpoint of greater `tree_size` for which no consistency proof from the
-    /// retained one could be established.
-    MissingConsistencyProof,
+    /// `retained` and `offered` share a `tree_size` with a different `root_hash`.
+    Equivocation,
+    /// `offered.tree_size` is smaller than an already-cosigned size, with no history entry at
+    /// the offered size itself.
+    SizeRegression,
+    /// `offered.tree_size > retained.tree_size` and the consistency proof between them,
+    /// carried in the refusal, was generated but did not verify.
+    ExtensionFailed,
 }
 
 /// Signed refusal evidence (adaptor profile §11.2): self-authenticating, not an AHL
@@ -100,10 +135,18 @@ pub struct RefusalEvidence {
     pub log_id: String,
     /// Why cosigning was refused.
     pub reason: RefusalReason,
-    /// The checkpoint this witness had already cosigned.
+    /// The checkpoint this witness had already cosigned (or, for `reason: Equivocation`
+    /// citing a standing floor, the original conflicting pair's first member).
     pub retained: Checkpoint,
-    /// The checkpoint this witness refused.
+    /// The checkpoint this witness refused (or, for `reason: Equivocation` citing a standing
+    /// floor, the original conflicting pair's second member — not necessarily the candidate
+    /// that triggered *this* refusal; see `detail`).
     pub offered: Checkpoint,
+    /// The consistency proof that was generated and failed to verify — present if and only
+    /// if `reason == ExtensionFailed`, so a verifier can rerun the same check (see
+    /// [`crate::consistency::verify_extension_failure`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub consistency_proof: Option<ConsistencyProofEvidence>,
     /// Informative text; never normative.
     pub detail: String,
     /// When this witness refused, as RFC 3339.
@@ -136,12 +179,20 @@ fn render_rfc3339(now_nanos: u64) -> WitnessResult<String> {
         .map_err(|_| WitnessError::BadCheckpointTime { value: now_nanos.to_string() })
 }
 
-fn cosign(
-    store: &Store,
+/// Which refusal reason to build, and the reason-specific evidence it carries. Bundled so
+/// [`refuse_conn`] stays at (and not over) `clippy::too_many_arguments`'s threshold.
+enum RefusalKind {
+    Equivocation,
+    SizeRegression,
+    ExtensionFailed(ConsistencyProofEvidence),
+}
+
+fn cosign_conn(
+    conn: &Connection,
     signer: &dyn WitnessSigner,
     governance: &GovernanceState,
     candidate: &Checkpoint,
-    now_nanos: u64,
+    now_rfc3339: &str,
 ) -> WitnessResult<WitnessOutcome> {
     let checkpoint_value = serde_json::to_value(candidate)?;
     let bytes = ahl_core::cosignature_bytes(&checkpoint_value, signer.witness_id());
@@ -150,26 +201,32 @@ fn cosign(
         witness_id: signer.witness_id().to_owned(),
         key_id: signer.key_id(),
         cosignature: signer.sign(&bytes),
-        cosigned_at: render_rfc3339(now_nanos)?,
+        cosigned_at: now_rfc3339.to_owned(),
     };
-    store.retain(&cosigned, governance.cadence_nanos(), governance.witness_grace_period_nanos())?;
+    store::insert_cosigned(
+        conn,
+        &cosigned,
+        governance.cadence_nanos(),
+        governance.witness_grace_period_nanos(),
+    )?;
     Ok(WitnessOutcome::Cosigned(Box::new(cosigned)))
 }
 
-/// Build, sign, record and return refusal evidence. `log_id` is taken from `offered` — by the
-/// time this is called, `offered.log_id` has already been checked against the configured
-/// anchor by [`verify_checkpoint_signature`], so it is the authoritative value, and threading
-/// a separate `log_id` parameter through as well would be redundant (and is what tipped this
-/// function over `clippy::too_many_arguments`).
-fn refuse(
-    store: &Store,
+fn build_refusal_evidence(
     signer: &dyn WitnessSigner,
     retained: &Checkpoint,
     offered: &Checkpoint,
-    reason: RefusalReason,
+    kind: &RefusalKind,
     detail: &str,
-    now_nanos: u64,
-) -> WitnessResult<WitnessOutcome> {
+    now_rfc3339: &str,
+) -> WitnessResult<RefusalEvidence> {
+    let (reason, consistency_proof) = match kind {
+        RefusalKind::Equivocation => (RefusalReason::Equivocation, None),
+        RefusalKind::SizeRegression => (RefusalReason::SizeRegression, None),
+        RefusalKind::ExtensionFailed(proof) => {
+            (RefusalReason::ExtensionFailed, Some(proof.clone()))
+        }
+    };
     let mut evidence = RefusalEvidence {
         kind: "witness-refusal".to_owned(),
         witness_id: signer.witness_id().to_owned(),
@@ -177,14 +234,72 @@ fn refuse(
         reason,
         retained: retained.clone(),
         offered: offered.clone(),
+        consistency_proof,
         detail: detail.to_owned(),
-        refused_at: render_rfc3339(now_nanos)?,
+        refused_at: now_rfc3339.to_owned(),
         key_id: signer.key_id(),
         signature: String::new(),
     };
     let bytes = refusal_signing_bytes(&evidence)?;
     evidence.signature = signer.sign(&bytes);
-    store.record_refusal(&evidence)?;
+    Ok(evidence)
+}
+
+/// Sign and persist refusal evidence that does **not** itself establish a new equivocation
+/// floor (`size-regression`, `extension-failed`, or an `equivocation` citing an
+/// already-recorded floor). For a *fresh* equivocation discovery, see
+/// [`record_equivocation_and_refuse_conn`], which persists the floor and the refusal
+/// together, atomically.
+fn refuse_conn(
+    conn: &Connection,
+    signer: &dyn WitnessSigner,
+    retained: &Checkpoint,
+    offered: &Checkpoint,
+    kind: &RefusalKind,
+    detail: &str,
+    now_rfc3339: &str,
+) -> WitnessResult<WitnessOutcome> {
+    let evidence = build_refusal_evidence(signer, retained, offered, kind, detail, now_rfc3339)?;
+    store::insert_refusal(conn, &evidence)?;
+    Ok(WitnessOutcome::Refused(Box::new(evidence)))
+}
+
+/// Sign and persist a *fresh* equivocation discovery: the floor row and the refusal evidence
+/// that justifies it are written in one `SQLite` transaction (core spec §3.3: "an equivocation
+/// record MUST be persisted in the same atomic step as the refusal it justifies").
+///
+/// `tree_size` is the shared size at which `checkpoint_a` and `checkpoint_b` conflict; the
+/// log id is taken from `checkpoint_b.log_id` (both checkpoints' log ids are already
+/// established as equal to the configured anchor by this point, so naming it separately
+/// would be redundant — and is what would tip this function over
+/// `clippy::too_many_arguments`).
+fn record_equivocation_and_refuse_conn(
+    conn: &Connection,
+    signer: &dyn WitnessSigner,
+    tree_size: u64,
+    checkpoint_a: &Checkpoint,
+    checkpoint_b: &Checkpoint,
+    now_rfc3339: &str,
+) -> WitnessResult<WitnessOutcome> {
+    let detail = format!(
+        "equivocation: two authenticated checkpoints share tree_size {tree_size} with \
+         different root_hash values"
+    );
+    let evidence = build_refusal_evidence(
+        signer,
+        checkpoint_a,
+        checkpoint_b,
+        &RefusalKind::Equivocation,
+        &detail,
+        now_rfc3339,
+    )?;
+    store::insert_equivocation_and_refusal(
+        conn,
+        &evidence.log_id,
+        tree_size,
+        now_rfc3339,
+        &evidence,
+    )?;
     Ok(WitnessOutcome::Refused(Box::new(evidence)))
 }
 
@@ -221,10 +336,10 @@ pub fn verify_cosignature(
 /// Verify the witness signature on refusal evidence (adaptor profile §11.2 check 1) against a
 /// specific, already-resolved witness key.
 ///
-/// This checks only the witness's own signature — it does not re-verify the log signatures
-/// on `retained`/`offered` (§11.2 check 2) or re-derive the conflict category (§11.2 check
-/// 3), which require the governing manifest's log key set and are the caller's
-/// responsibility (see [`crate::governance`] and [`crate::consistency`]).
+/// This checks only the witness's own signature — it does not re-derive the refusal's
+/// *claim* (see [`verify_refusal_claim`] for that) or re-verify the log signatures on
+/// `retained`/`offered` (§11.2 check 2), which require the governing manifest's log key set
+/// and are the caller's responsibility (see [`crate::governance`]).
 ///
 /// # Errors
 ///
@@ -238,39 +353,61 @@ pub fn verify_refusal_signature(
     Ok(ahl_core::verify_signature(witness_key, &bytes, &evidence.signature)?)
 }
 
+/// Independently recheck a [`RefusalEvidence`]'s **claim**, purely from the evidence it
+/// carries, without trusting this witness's classification.
+///
+/// Core spec §3.3: "every refusal reason MUST be independently checkable from the evidence
+/// it carries." This is separate from [`verify_refusal_signature`], which only checks that
+/// this witness signed the evidence; a complete check runs both, plus §11.2's own check 2
+/// (the log signatures on `retained`/`offered`), which needs the governing manifest and is
+/// therefore the caller's responsibility.
+///
+/// # Errors
+///
+/// Propagates a parsing error from a malformed carried hash (`reason: ExtensionFailed`).
+pub fn verify_refusal_claim(evidence: &RefusalEvidence) -> WitnessResult<bool> {
+    match evidence.reason {
+        RefusalReason::Equivocation => Ok(evidence.retained.tree_size
+            == evidence.offered.tree_size
+            && evidence.retained.root_hash != evidence.offered.root_hash),
+        RefusalReason::SizeRegression => {
+            Ok(evidence.offered.tree_size < evidence.retained.tree_size)
+        }
+        RefusalReason::ExtensionFailed => {
+            let Some(proof) = &evidence.consistency_proof else { return Ok(false) };
+            if evidence.offered.tree_size <= evidence.retained.tree_size {
+                return Ok(false);
+            }
+            consistency::verify_extension_failure(
+                proof,
+                &evidence.retained.root_hash,
+                &evidence.offered.root_hash,
+            )
+        }
+    }
+}
+
 /// Run the core spec §3.3 state machine on one candidate checkpoint.
 ///
-/// Pipeline:
-///
-/// 1. `entries_prefix` MUST cover `[0, candidate.tree_size)` exactly — adaptor profile §10.6:
-///    under this profile, enumerated governance requires the full range, since no
-///    typed-subset proof exists to prove a shorter set is complete.
-/// 2. Governance is resolved from `entries_prefix` against `anchor` ([`crate::governance`]),
-///    and the candidate's signature is verified against the resolved, activation-bound
-///    signing key ([`crate::checkpoint::verify_checkpoint_signature`]). A candidate failing
-///    either step is refused outright as a [`WitnessError`] — see the module docs for why
-///    this is not refusal evidence.
-/// 3. If `anchor.log_id` already has a recorded equivocation floor
-///    ([`Store::equivocation_floor`]), every further candidate is refused unconditionally —
-///    see the module docs, "Equivocation ends the series" — without running ordinary
-///    consistency checking.
-/// 4. If this is the first checkpoint ever witnessed for the log, its root MUST recompute
-///    from `entries_prefix` (there is no retained checkpoint for a consistency proof to run
-///    from); a mismatch is a [`WitnessError::CheckpointRootMismatch`], again not refusal
-///    evidence — adaptor profile §11.2's schema has no way to name an absent `retained`
-///    checkpoint, so nothing can be published as a two-checkpoint refusal for this case.
-/// 5. Otherwise the candidate is classified against the retained checkpoint
-///    ([`crate::consistency::check`]): consistent candidates are cosigned, retained, and the
-///    outcome published; an [`ConsistencyOutcome::Equivocation`] additionally records the
-///    equivocation floor before publishing refusal evidence; any other inconsistency produces
-///    refusal evidence without recording a floor, and the retained checkpoint is left
-///    unchanged either way.
+/// `entries_prefix` MUST cover `[0, candidate.tree_size)` exactly — adaptor profile §10.6:
+/// under this profile, enumerated governance requires the full range, since no typed-subset
+/// proof exists to prove a shorter set is complete. Governance is resolved from it against
+/// `anchor` ([`crate::governance`]), and the candidate's signature is verified against the
+/// resolved, activation-bound signing key
+/// ([`crate::checkpoint::verify_checkpoint_signature`]) — both pure, store-independent
+/// computations, performed before the store is ever touched. Everything from there on —
+/// every read this decision depends on, and the write it produces — runs inside one
+/// `Store::with_lock` critical section (see the crate-private `transition` function and the
+/// module docs, "serialize and make atomic").
 ///
 /// # Errors
 ///
 /// [`WitnessError::IncompleteEntries`], [`WitnessError::GovernanceChainUnresolvable`], a
 /// checkpoint-authentication error from [`crate::checkpoint::verify_checkpoint_signature`],
-/// or [`WitnessError::CheckpointRootMismatch`] for the bootstrap case above.
+/// [`WitnessError::CheckpointRootMismatch`] for a bad bootstrap checkpoint (see the module
+/// docs, "Bootstrap refusal carries no evidence"), or a propagated error from
+/// [`crate::consistency::check`] if a consistency proof cannot be generated at all (should not
+/// arise given `entries_prefix`'s completeness invariant; see [`crate::consistency`]).
 pub fn witness_checkpoint(
     store: &Store,
     signer: &dyn WitnessSigner,
@@ -286,82 +423,122 @@ pub fn witness_checkpoint(
         return Err(WitnessError::IncompleteEntries { have, need: candidate.tree_size });
     }
 
+    // Authentication touches only `entries_prefix` and `anchor` — pure, store-independent —
+    // so it is safe and correct to perform before acquiring the store's lock.
     let governance = governance::resolve(entries_prefix, anchor)?;
     let key = governance.resolve_log_key(&candidate.key_id, candidate.tree_size)?;
     verify_checkpoint_signature(candidate, raw, &anchor.log_id, key)?;
 
     let leaf_hashes: Vec<Hash> = entries_prefix.iter().map(|b| log_leaf_hash(b)).collect();
+    let now_rfc3339 = render_rfc3339(now_nanos)?;
 
-    let retained = store.get_retained(&candidate.log_id)?;
+    store.with_lock(|conn| {
+        transition(conn, signer, &governance, candidate, &leaf_hashes, &now_rfc3339)
+    })
+}
 
-    if let Some(floor) = store.equivocation_floor(&candidate.log_id)? {
-        // Core spec §7.3: once a log has equivocated, nothing at or beyond the floor may
-        // ground a witness assertion. Refuse every further candidate outright — never resume
-        // ordinary consistency checking, which could make one branch look canonical again.
-        let retained_for_evidence =
-            retained.as_ref().map_or_else(|| candidate.clone(), |r| r.cosigned.checkpoint.clone());
-        return refuse(
-            store,
+/// The atomic body of [`witness_checkpoint`]: every read this decision depends on, and the
+/// resulting write, run against the same `conn` inside the caller's single lock acquisition.
+fn transition(
+    conn: &Connection,
+    signer: &dyn WitnessSigner,
+    governance: &GovernanceState,
+    candidate: &Checkpoint,
+    leaf_hashes: &[Hash],
+    now_rfc3339: &str,
+) -> WitnessResult<WitnessOutcome> {
+    let log_id = &candidate.log_id;
+
+    // Core spec §3.3: equivocation is permanent. Re-read the floor inside this same critical
+    // section — never trust a value read before the lock was (re)acquired.
+    if let Some(floor) = store::equivocation_floor(conn, log_id)? {
+        let (original_retained, original_offered) =
+            store::original_equivocation_pair(conn, log_id)?.ok_or_else(|| {
+                WitnessError::StoreInit(
+                    "equivocation floor recorded with no evidence pair".to_owned(),
+                )
+            })?;
+        let detail = format!(
+            "log equivocated at tree_size {floor}; candidate at tree_size {} refused without \
+             further evaluation",
+            candidate.tree_size
+        );
+        return refuse_conn(
+            conn,
             signer,
-            &retained_for_evidence,
-            candidate,
-            RefusalReason::Inconsistent,
-            &format!(
-                "log equivocated at tree_size {floor}; refusing to extend trust to any \
-                 further checkpoint"
-            ),
-            now_nanos,
+            &original_retained,
+            &original_offered,
+            &RefusalKind::Equivocation,
+            &detail,
+            now_rfc3339,
         );
     }
 
-    match retained {
+    // Core spec §3.3: "compare against the whole retained history, not the newest member."
+    if let Some(existing) = store::find_cosigned_at_size(conn, log_id, candidate.tree_size)? {
+        let existing_checkpoint = existing.cosigned.checkpoint;
+        if existing_checkpoint.root_hash == candidate.root_hash {
+            // The exact checkpoint this witness already cosigned, resubmitted: idempotent.
+            return cosign_conn(conn, signer, governance, candidate, now_rfc3339);
+        }
+        return record_equivocation_and_refuse_conn(
+            conn,
+            signer,
+            candidate.tree_size,
+            &existing_checkpoint,
+            candidate,
+            now_rfc3339,
+        );
+    }
+
+    match store::get_retained(conn, log_id)? {
         None => {
-            let root = compute_root(&leaf_hashes);
+            let root = compute_root(leaf_hashes);
             let candidate_root = ahl_core::parse_hash_hex(&candidate.root_hash)?;
             if root != candidate_root {
                 return Err(WitnessError::CheckpointRootMismatch {
                     tree_size: candidate.tree_size,
                 });
             }
-            cosign(store, signer, &governance, candidate, now_nanos)
+            cosign_conn(conn, signer, governance, candidate, now_rfc3339)
         }
-        Some(RetainedCheckpoint { cosigned, .. }) => {
-            let retained_checkpoint = cosigned.checkpoint;
-            match consistency::check(&retained_checkpoint, candidate, &leaf_hashes)? {
+        Some(retained) => {
+            let retained_checkpoint = retained.cosigned.checkpoint;
+            match consistency::check(&retained_checkpoint, candidate, leaf_hashes)? {
                 ConsistencyOutcome::Consistent => {
-                    cosign(store, signer, &governance, candidate, now_nanos)
+                    cosign_conn(conn, signer, governance, candidate, now_rfc3339)
                 }
-                ConsistencyOutcome::Equivocation => {
-                    let detected_at = render_rfc3339(now_nanos)?;
-                    store.record_equivocation(&anchor.log_id, candidate.tree_size, &detected_at)?;
-                    refuse(
-                        store,
-                        signer,
-                        &retained_checkpoint,
-                        candidate,
-                        RefusalReason::Inconsistent,
-                        "equivocation: retained and offered share a tree_size with \
-                         different root_hash values",
-                        now_nanos,
-                    )
-                }
-                ConsistencyOutcome::Inconsistent => refuse(
-                    store,
+                // Unreachable via this call site in practice: `find_cosigned_at_size` above
+                // already inspects the very row `retained` would be if the sizes matched, so
+                // an equal-size mismatch can never survive to here. Handled identically
+                // anyway, defensively, rather than assumed impossible.
+                ConsistencyOutcome::Equivocation => record_equivocation_and_refuse_conn(
+                    conn,
                     signer,
+                    candidate.tree_size,
                     &retained_checkpoint,
                     candidate,
-                    RefusalReason::Inconsistent,
-                    "offered checkpoint conflicts with the retained one",
-                    now_nanos,
+                    now_rfc3339,
                 ),
-                ConsistencyOutcome::ProofUnavailable => refuse(
-                    store,
+                ConsistencyOutcome::SizeRegression => refuse_conn(
+                    conn,
                     signer,
                     &retained_checkpoint,
                     candidate,
-                    RefusalReason::MissingConsistencyProof,
-                    "no consistency proof could be built from the supplied entries",
-                    now_nanos,
+                    &RefusalKind::SizeRegression,
+                    "offered checkpoint's tree_size is smaller than an already-cosigned one, \
+                     and no prior cosigned checkpoint exists at the offered size itself",
+                    now_rfc3339,
+                ),
+                ConsistencyOutcome::ExtensionFailed(proof) => refuse_conn(
+                    conn,
+                    signer,
+                    &retained_checkpoint,
+                    candidate,
+                    &RefusalKind::ExtensionFailed(proof),
+                    "a consistency proof from the retained checkpoint to the offered one was \
+                     generated but did not verify",
+                    now_rfc3339,
                 ),
             }
         }
@@ -406,6 +583,9 @@ pub fn published_checkpoint(store: &Store, log_id: &str) -> WitnessResult<Publis
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use crate::config::{Ed25519WitnessSigner, KeyObjectSpec, LogAnchorSpec};
     use crate::store::Store;
@@ -589,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inconsistent_checkpoint_is_refused_with_evidence_and_not_cosigned() {
+    fn an_extension_that_fails_consistency_is_refused_with_a_replayable_proof() {
         let fx = fixture("44", "dd");
         let entries = genesis_entries(&fx);
         let root1 = compute_root(&[fx.genesis_leaf]);
@@ -621,12 +801,17 @@ mod tests {
             &entries,
             base_nanos(),
         )
-        .expect("authenticates, then refuses on inconsistency");
+        .expect("authenticates, then refuses on a failed extension");
         match outcome {
             WitnessOutcome::Refused(evidence) => {
-                assert_eq!(evidence.reason, RefusalReason::Inconsistent);
+                assert_eq!(evidence.reason, RefusalReason::ExtensionFailed);
                 assert_eq!(evidence.retained.tree_size, 1);
                 assert_eq!(evidence.offered.tree_size, 2);
+                let proof = evidence.consistency_proof.as_ref().expect("carried for this reason");
+                assert_eq!(proof.from_size, 1);
+                assert_eq!(proof.to_size, 2);
+                // Independently checkable, per core spec §3.3.
+                assert!(verify_refusal_claim(&evidence).expect("well-formed"));
                 let key = fx.signer.verifying_key();
                 assert!(verify_refusal_signature(&evidence, &key).expect("well-formed"));
             }
@@ -662,12 +847,14 @@ mod tests {
         .expect("authenticates, then refuses on equivocation");
         match outcome {
             WitnessOutcome::Refused(evidence) => {
-                assert_eq!(evidence.reason, RefusalReason::Inconsistent);
+                assert_eq!(evidence.reason, RefusalReason::Equivocation);
+                assert!(evidence.consistency_proof.is_none());
+                assert!(verify_refusal_claim(&evidence).expect("well-formed"));
             }
             WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
         }
 
-        // Core spec §7.3: once equivocation is recorded, the floor is permanent for this log.
+        // Core spec §3.3: once equivocation is recorded, the floor is permanent for this log.
         assert_eq!(fx.store.equivocation_floor(&fx.anchor.log_id).expect("query"), Some(1));
 
         // A verifier reading the published view MUST see the equivocation, not a chosen
@@ -676,6 +863,122 @@ mod tests {
             PublishedCheckpoint::Equivocated { floor_tree_size } => assert_eq!(floor_tree_size, 1),
             other => panic!("expected an equivocated view, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn equivocation_is_detected_against_full_history_not_only_the_newest_member() {
+        // Core spec §3.3: "An offered checkpoint whose (log_id, tree_size) matches one
+        // already cosigned with a different root_hash is equivocation, whatever its size
+        // relative to the newest retained member." Cosign sizes 1, 2, 3 genuinely, then offer
+        // a CONFLICTING size-2 checkpoint while the retained latest is size 3. A witness that
+        // only compared against the newest member would misclassify this as a harmless size
+        // regression (2 < 3) and never notice the equivocation.
+        let fx = fixture("bb", "cc");
+        let mut entries = genesis_entries(&fx);
+        let root1 = compute_root(&[fx.genesis_leaf]);
+        let cp1 = signed_checkpoint(&fx, 1, root1, "2026-01-01T00:00:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp1, None, &entries, base_nanos())
+            .expect("size 1 cosigns");
+
+        let entry_2 = ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": 2 },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }));
+        let leaf_2 = log_leaf_hash(&entry_2);
+        entries.push(entry_2);
+        let genuine_root_2 = compute_root(&[fx.genesis_leaf, leaf_2]);
+        let cp2 = signed_checkpoint(&fx, 2, genuine_root_2, "2026-01-01T00:02:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp2, None, &entries, base_nanos())
+            .expect("size 2 cosigns");
+
+        let entry_3 = ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": 3 },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }));
+        let leaf_3 = log_leaf_hash(&entry_3);
+        let mut entries_3 = entries.clone();
+        entries_3.push(entry_3);
+        let root_3 = compute_root(&[fx.genesis_leaf, leaf_2, leaf_3]);
+        let cp3 = signed_checkpoint(&fx, 3, root_3, "2026-01-01T00:03:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp3, None, &entries_3, base_nanos())
+            .expect("size 3 cosigns");
+
+        // Now offer a conflicting size-2 checkpoint: same tree_size as an already-cosigned
+        // member, but a different root — and smaller than the CURRENT retained (size 3).
+        let mut conflicting_cp2 =
+            signed_checkpoint(&fx, 2, [0x42u8; 32], "2026-01-01T00:02:30.000000000Z");
+        let blob = crate::checkpoint::checkpoint_blob(&conflicting_cp2).expect("well-formed");
+        conflicting_cp2.signature = fx.log_key.sign(&blob);
+
+        let outcome = witness_checkpoint(
+            &fx.store,
+            &fx.signer,
+            &fx.anchor,
+            &conflicting_cp2,
+            None,
+            &entries, // covers [0, 2), matching conflicting_cp2.tree_size == 2
+            base_nanos(),
+        )
+        .expect("authenticates, then refuses on equivocation");
+        match outcome {
+            WitnessOutcome::Refused(evidence) => {
+                assert_eq!(
+                    evidence.reason,
+                    RefusalReason::Equivocation,
+                    "a witness comparing only against the newest member would wrongly report \
+                     size-regression here"
+                );
+                assert_eq!(evidence.retained.tree_size, 2);
+                assert_eq!(evidence.offered.tree_size, 2);
+            }
+            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+        }
+        assert_eq!(fx.store.equivocation_floor(&fx.anchor.log_id).expect("query"), Some(2));
+        // The size-3 checkpoint, cosigned before the conflict was found, remains on record,
+        // but is no longer presented as canonical (see `published_checkpoint`).
+        assert_eq!(fx.store.list_cosigned(&fx.anchor.log_id).expect("query").len(), 3);
+        match published_checkpoint(&fx.store, &fx.anchor.log_id).expect("well-formed") {
+            PublishedCheckpoint::Equivocated { floor_tree_size } => assert_eq!(floor_tree_size, 2),
+            other => panic!("expected an equivocated view, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resubmitting_an_already_cosigned_non_latest_checkpoint_is_idempotent() {
+        let fx = fixture("dd", "ee");
+        let mut entries = genesis_entries(&fx);
+        let root1 = compute_root(&[fx.genesis_leaf]);
+        let cp1 = signed_checkpoint(&fx, 1, root1, "2026-01-01T00:00:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp1, None, &entries, base_nanos())
+            .expect("size 1 cosigns");
+
+        let entry_2 = ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": 2 },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }));
+        entries.push(entry_2);
+        let root2 = compute_root(&[fx.genesis_leaf, log_leaf_hash(&entries[1])]);
+        let cp2 = signed_checkpoint(&fx, 2, root2, "2026-01-01T00:01:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp2, None, &entries, base_nanos())
+            .expect("size 2 cosigns");
+
+        // Resubmit the ORIGINAL size-1 checkpoint (not the latest) with its genuine root.
+        let genesis_only = genesis_entries(&fx);
+        let outcome = witness_checkpoint(
+            &fx.store,
+            &fx.signer,
+            &fx.anchor,
+            &cp1,
+            None,
+            &genesis_only,
+            base_nanos(),
+        )
+        .expect("idempotent resubmission cosigns again rather than erroring");
+        assert!(matches!(outcome, WitnessOutcome::Cosigned(_)));
+        assert!(fx.store.equivocation_floor(&fx.anchor.log_id).expect("query").is_none());
+        // The latest retained checkpoint is unaffected.
+        let retained = fx.store.get_retained(&fx.anchor.log_id).expect("query").expect("present");
+        assert_eq!(retained.checkpoint().tree_size, 2);
     }
 
     #[test]
@@ -714,7 +1017,18 @@ mod tests {
             base_nanos(),
         )
         .expect("authenticates, then refuses because the log is equivocated");
-        assert!(matches!(outcome, WitnessOutcome::Refused(_)));
+        match outcome {
+            WitnessOutcome::Refused(evidence) => {
+                // Cites the ORIGINAL conflicting pair (both at tree_size 1) — independently
+                // checkable exactly like a fresh equivocation report — not `cp3`.
+                assert_eq!(evidence.reason, RefusalReason::Equivocation);
+                assert_eq!(evidence.retained.tree_size, 1);
+                assert_eq!(evidence.offered.tree_size, 1);
+                assert!(verify_refusal_claim(&evidence).expect("well-formed"));
+                assert!(evidence.detail.contains("tree_size 2"));
+            }
+            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+        }
         // Still not cosigned or retained.
         let retained = fx.store.get_retained(&fx.anchor.log_id).expect("query").expect("present");
         assert_eq!(retained.checkpoint().tree_size, 1);
@@ -826,5 +1140,121 @@ mod tests {
             ),
             Err(WitnessError::RawBlobMismatch)
         ));
+    }
+
+    #[test]
+    fn concurrent_conflicting_extensions_at_the_same_size_equivocate_exactly_once() {
+        // Core spec §3.3, "serialize and make atomic": two concurrent submissions extending
+        // the same retained checkpoint to different roots at the same new size MUST NOT both
+        // be cosigned. Runs the state machine from two real OS threads against one shared
+        // `Store`, synchronized with a barrier so both reach `witness_checkpoint` as close to
+        // simultaneously as possible, and checks the outcome shape rather than which thread
+        // happened to win the race (which is legitimately non-deterministic).
+        let fx = fixture("cc", "dd");
+        let entries0 = genesis_entries(&fx);
+        let root1 = compute_root(&[fx.genesis_leaf]);
+        let cp1 = signed_checkpoint(&fx, 1, root1, "2026-01-01T00:00:00.000000000Z");
+        witness_checkpoint(&fx.store, &fx.signer, &fx.anchor, &cp1, None, &entries0, base_nanos())
+            .expect("bootstrap cosigns");
+
+        let entry_a = ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": "a" },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }));
+        let entry_b = ahl_core::jcs(&serde_json::json!({
+            "payload": { "n": "b" },
+            "signatures": [ { "key_id": "sha256:aa", "sig": "base64:bb" } ],
+        }));
+        let root_a = compute_root(&[fx.genesis_leaf, log_leaf_hash(&entry_a)]);
+        let root_b = compute_root(&[fx.genesis_leaf, log_leaf_hash(&entry_b)]);
+        let cp_a = signed_checkpoint(&fx, 2, root_a, "2026-01-01T00:01:00.000000000Z");
+        let cp_b = signed_checkpoint(&fx, 2, root_b, "2026-01-01T00:01:00.000000000Z");
+        let root_hash_a = cp_a.root_hash.clone();
+        let root_hash_b = cp_b.root_hash.clone();
+
+        let mut entries_a = entries0.clone();
+        entries_a.push(entry_a);
+        let mut entries_b = entries0;
+        entries_b.push(entry_b);
+
+        let Fixture { store, signer, anchor, .. } = fx;
+        let store = Arc::new(store);
+        let signer = Arc::new(signer);
+        let anchor = Arc::new(anchor);
+        let barrier = Arc::new(Barrier::new(2));
+        let now = base_nanos();
+
+        let handle_a = {
+            let (store, signer, anchor, barrier) = (
+                Arc::clone(&store),
+                Arc::clone(&signer),
+                Arc::clone(&anchor),
+                Arc::clone(&barrier),
+            );
+            thread::spawn(move || {
+                barrier.wait();
+                witness_checkpoint(
+                    store.as_ref(),
+                    signer.as_ref(),
+                    anchor.as_ref(),
+                    &cp_a,
+                    None,
+                    &entries_a,
+                    now,
+                )
+            })
+        };
+        let handle_b = {
+            let (store, signer, anchor, barrier) = (
+                Arc::clone(&store),
+                Arc::clone(&signer),
+                Arc::clone(&anchor),
+                Arc::clone(&barrier),
+            );
+            thread::spawn(move || {
+                barrier.wait();
+                witness_checkpoint(
+                    store.as_ref(),
+                    signer.as_ref(),
+                    anchor.as_ref(),
+                    &cp_b,
+                    None,
+                    &entries_b,
+                    now,
+                )
+            })
+        };
+
+        let outcome_a = handle_a.join().expect("thread a panicked").expect("thread a errored");
+        let outcome_b = handle_b.join().expect("thread b panicked").expect("thread b errored");
+
+        let outcomes = [&outcome_a, &outcome_b];
+        let cosigned_count =
+            outcomes.iter().filter(|o| matches!(o, WitnessOutcome::Cosigned(_))).count();
+        let refused_count =
+            outcomes.iter().filter(|o| matches!(o, WitnessOutcome::Refused(_))).count();
+        assert_eq!(cosigned_count, 1, "exactly one concurrent submission must be cosigned");
+        assert_eq!(refused_count, 1, "the other must be refused, never both cosigned");
+
+        let refused = outcomes
+            .into_iter()
+            .find_map(|o| match o {
+                WitnessOutcome::Refused(evidence) => Some(evidence),
+                WitnessOutcome::Cosigned(_) => None,
+            })
+            .expect("exactly one refusal");
+        assert_eq!(refused.reason, RefusalReason::Equivocation);
+        assert_eq!(refused.retained.tree_size, 2);
+        assert_eq!(refused.offered.tree_size, 2);
+        assert!(verify_refusal_claim(refused).expect("well-formed"));
+
+        assert_eq!(store.equivocation_floor(&anchor.log_id).expect("query"), Some(2));
+        let retained = store.get_retained(&anchor.log_id).expect("query").expect("present");
+        assert_eq!(retained.checkpoint().tree_size, 2);
+        assert!(
+            retained.checkpoint().root_hash == root_hash_a
+                || retained.checkpoint().root_hash == root_hash_b,
+            "the winning cosign must be exactly one of the two genuine candidate roots"
+        );
     }
 }

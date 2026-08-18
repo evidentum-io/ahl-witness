@@ -57,39 +57,115 @@ mirror or log for new checkpoints — see "Feeding the witness" below.
    stale; it must report itself so.
 ```
 
-`witness::witness_checkpoint` is the single entry point implementing all four steps. Given a
-candidate checkpoint, the complete ordered entry byte sequence `[0, tree_size)` (needed to
-resolve governance — see below), and the current time, it returns either
-`WitnessOutcome::Cosigned` or `WitnessOutcome::Refused`, or a `WitnessError` for a candidate
-that never authenticated at all (see "Authentication failures are not refusal evidence" in the
-module's doc comment for why that distinction matters and is drawn deliberately).
+`witness::witness_checkpoint` is the single entry point implementing all four steps, plus the
+normative **"obligations that make the machine sound"** core spec §3.3 added in a later round
+(commit `92f8fc4`) — this section and the next three describe those obligations and exactly how
+this crate meets each one. Given a candidate checkpoint, the complete ordered entry byte
+sequence `[0, tree_size)` (needed to resolve governance — see below), and the current time, it
+returns either `WitnessOutcome::Cosigned` or `WitnessOutcome::Refused`, or a `WitnessError` for a
+candidate that never authenticated at all (see "Authentication failures are not refusal
+evidence" in the module's doc comment for why that distinction matters and is drawn
+deliberately).
 
-Consistency is decided by `consistency::check` without trusting any externally-computed proof:
-given leaf hashes covering `[0, offered.tree_size)`, it classifies the pair as `Consistent` (a
-genuine append-only extension, or an idempotent republish at equal size and root),
-`Equivocation` (equal size with a different root), `Inconsistent` (a size regression, or a
-consistency proof that fails to verify), or `ProofUnavailable` (a proof could not even be
-generated from the supplied material).
+Consistency between two specific checkpoints is decided by `consistency::check` without trusting
+any externally-computed proof: given leaf hashes covering `[0, offered.tree_size)`, it
+classifies the pair as `Consistent` (a genuine append-only extension, or an idempotent republish
+at equal size and root), `Equivocation` (equal size with a different root), `SizeRegression` (a
+smaller offered size), or `ExtensionFailed` (a larger offered size whose consistency proof was
+generated but does not verify — the proof is carried in the outcome). A proof that cannot even
+be *generated* is propagated as an error, never produced as a refusable outcome — see "Refusal
+reason taxonomy" below for why.
 
-## Equivocation ends the series (core spec §7.3)
+## Equivocation ends the series (core spec §7.3 and §3.3)
 
-Core spec §7.3 states this normatively and in terms that apply directly to a witness: "Two
-authenticated members sharing a `tree_size` with differing `root_hash` values are equivocation,
-not a tie … From the lowest `tree_size` at which it occurs, the series is no longer canonical …
-Detecting equivocation and then continuing to serve one branch is a conformance violation."
+Core spec §7.3: "Two authenticated members sharing a `tree_size` with differing `root_hash`
+values are equivocation, not a tie … From the lowest `tree_size` at which it occurs, the series
+is no longer canonical … Detecting equivocation and then continuing to serve one branch is a
+conformance violation." Core spec §3.3 sharpens this into two obligations a witness must meet:
 
-`witness_checkpoint` therefore does more than refuse the one conflicting candidate: the first
-time it observes equal-`tree_size`, different-`root_hash` checkpoints for a log, it records an
-**equivocation floor** (`Store::record_equivocation`) and every later call for that log —
-however validly signed, however genuine an extension it might otherwise be — is refused without
-running ordinary consistency checking, so no later checkpoint can ever be cosigned in a way that
-would make either conflicting branch look canonical again. The read side,
-`witness::published_checkpoint`, is the counterpart: once a log has an equivocation floor, it
-reports `PublishedCheckpoint::Equivocated` (surfaced over HTTP as `409 Conflict` on both
-`GET /v1/logs/{log_id}/checkpoint` and `.../freshness`) instead of the latest retained row,
-however validly that row was itself cosigned before the divergence was found. The refusal
-evidence published for the triggering pair (`GET /v1/logs/{log_id}/refusals`) still carries both
-conflicting checkpoints — nothing about equivocation handling weakens that guarantee.
+- **Compare against the whole retained history, not the newest member.** `consistency::check`
+  only ever compares `offered` against one `retained` checkpoint, but a witness that used it
+  against just the *latest* retained member would misclassify an offered checkpoint conflicting
+  with an *older*, non-latest cosigned member as a harmless size regression and never notice the
+  equivocation — exactly the failure mode a first implementation round of this crate had.
+  `witness_checkpoint` therefore always queries the store for a previously cosigned checkpoint at
+  the *exact* offered `tree_size` first (`store::find_cosigned_at_size`, scanning the complete
+  cosigned history, not just the newest row); only once that query finds nothing does it fall
+  back to comparing against the single latest retained checkpoint via `consistency::check`.
+- **Equivocation is permanent for that log.** The first time either path finds a conflict, this
+  crate records an **equivocation floor** and every later call for that log — however validly
+  signed, however genuine an extension it might otherwise be — is refused without running
+  ordinary consistency checking at all, so no later checkpoint can ever be cosigned in a way that
+  would make either conflicting branch look canonical again. Refusals citing a standing floor
+  reuse the *original* conflicting pair as evidence (not the new, unrelated candidate, which
+  appears only in the free-text `detail` field) — see "Refusal reason taxonomy" for why that
+  matters.
+
+The read side, `witness::published_checkpoint`, is the query counterpart: once a log has an
+equivocation floor, it reports `PublishedCheckpoint::Equivocated` (surfaced over HTTP as
+`409 Conflict` on both `GET /v1/logs/{log_id}/checkpoint` and `.../freshness`) instead of the
+latest retained row, however validly that row was itself cosigned before the divergence was
+found.
+
+## Serialization and atomicity (core spec §3.3)
+
+"The retain–verify–classify–cosign transition MUST be serialized per log and atomic. Two
+concurrent submissions extending the same retained state to different roots at the same size
+MUST NOT both be cosigned; state MUST be re-read inside the critical section, and an equivocation
+record MUST be persisted in the same atomic step as the refusal it justifies."
+
+A first implementation round satisfied this only per individual `Store` call — the read, the
+classification, and the write were each their own lock acquisition, so two concurrent requests
+could both read the same pre-write state, both pass classification, and both be cosigned: the
+witness itself would equivocate. The fix has two parts:
+
+- **`Store::with_lock`** (crate-private) holds the store's one mutex for an *entire* decision —
+  every read `witness_checkpoint` depends on, and the resulting write — rather than once per
+  method call. `witness::transition` (crate-private) is the function that runs inside it: it
+  re-reads the equivocation floor, the exact-size history match, and the latest retained
+  checkpoint fresh, every call, and never trusts a value read before the lock was (re)acquired.
+- **A real `SQLite` transaction** (`store::insert_equivocation_and_refusal`, via
+  `Connection::unchecked_transaction`) wraps the two writes a fresh equivocation discovery
+  requires — the `equivocations` floor row and the refusal evidence that justifies it — so they
+  persist together or not at all, independent of the in-process lock (which protects against
+  concurrent callers, not against a crash mid-write).
+
+`witness::tests::concurrent_conflicting_extensions_at_the_same_size_equivocate_exactly_once`
+exercises this from two real OS threads racing against one shared, `Arc`-wrapped `Store`,
+synchronized with a `Barrier`, asserting the outcome shape (exactly one cosign, one
+equivocation refusal, one floor) rather than which thread happens to win — which is legitimately
+non-deterministic and, run repeatedly, was confirmed stable in outcome regardless.
+
+## Refusal reason taxonomy (core spec §3.3)
+
+"Every refusal reason MUST be independently checkable from the evidence it carries; a reason
+whose verification procedure is undefined MUST NOT be emitted." `RefusalReason` has exactly
+three members meeting that bar — this is the taxonomy the adaptor profile is expected to adopt:
+
+| reason | when | what a verifier independently rechecks |
+| --- | --- | --- |
+| `equivocation` | `retained`/`offered` share a `tree_size` with different `root_hash` — found either at the offered size directly, or cited again (with the *original* pair) for every later candidate while the log's floor stands | `retained.tree_size == offered.tree_size && retained.root_hash != offered.root_hash` |
+| `size-regression` | `offered.tree_size` is smaller than an already-cosigned size, with no history entry at the offered size itself | `offered.tree_size < retained.tree_size` |
+| `extension-failed` | `offered.tree_size > retained.tree_size` and a consistency proof was generated but does not verify | reconstruct the carried `consistency_proof` and rerun RFC 9162 verification against the two carried roots (`consistency::verify_extension_failure`) |
+
+`witness::verify_refusal_claim` implements exactly this table and is unit-tested for all three
+reasons, including a genuine replay of a carried `extension-failed` proof.
+
+Adaptor profile §11.2's `missing-consistency-proof` reason is **deliberately not part of this
+taxonomy**. It is written as though a consistency proof is handed to the witness and can simply
+be absent; this crate instead always supplies the complete `[0, offered.tree_size)` entry range
+before classifying anything (adaptor profile §10.6), so a proof between two sizes it already
+holds material for can only fail to *generate* for reasons that are not claims about the log's
+checkpoints — there is no proof to carry, and nothing for a verifier to recheck. Such a failure
+is propagated as a `WitnessError`, never emitted as a refusal reason, per the "MUST NOT be
+emitted" clause above.
+
+The prior taxonomy (`inconsistent` covering both size regressions and failed extensions
+indistinguishably, plus `missing-consistency-proof`) failed this bar for size regressions and
+failed extensions: a verifier holding only `retained`/`offered` could confirm an equal-size
+conflict but could not, from two root hashes alone, distinguish "the log shrank" from "the
+witness's extension proof failed" — nor recheck the second without the proof, which the old
+schema never carried. That gap is what this round's taxonomy closes.
 
 ## Why enumerated governance, not a shortcut
 
@@ -164,42 +240,55 @@ A verifier can therefore obtain a witnessed checkpoint, or evidence that the log
 without going through the log operator at all (core spec §3.3's verifier algorithm: "accept a
 checkpoint C only with a valid witness cosignature").
 
-## Specification ambiguities encountered
+## Specification questions raised, and how core spec settled them
 
-- **Refusal evidence assumes a prior retained checkpoint.** Adaptor profile §11.2's schema
-  requires both a `retained` and an `offered` checkpoint. The very first checkpoint ever
-  witnessed for a log has no `retained` predecessor; if its claimed root does not recompute from
-  its own entries, there is nothing to pair it with in a two-checkpoint refusal. This crate
-  reports that case as `WitnessError::CheckpointRootMismatch` (an authentication-level failure)
-  rather than manufacturing refusal evidence with a placeholder `retained` field. Neither core
-  spec §3.3 nor the adaptor profile names this bootstrap case, and it remains unnamed even after
-  the §7.3 "Equivocation ends the series" addition, which is written in terms of two *already
-  authenticated* members — a single unauthenticatable candidate with no predecessor falls
-  outside it.
-- **"Missing consistency proof" is under-specified for a witness that builds its own proofs.**
-  Adaptor profile §11.2 writes as though a consistency proof is handed to the witness and can be
-  simply absent. This crate instead recomputes consistency itself from supplied entries (see
-  "Why enumerated governance, not a shortcut" — the same material serves both purposes), so
-  `missing-consistency-proof` is reachable only when a proof cannot even be *generated* from
-  what was supplied. The distinction between this and `inconsistent` is drawn by this crate, not
-  dictated unambiguously by the profile text.
-- **Freshness governance snapshot.** Core spec §3.3 item 4 and adaptor profile §11.3 both say
-  staleness is judged "against the cadence of the manifest version governing the range in
-  question, not against the current version's value," but neither spells out which checkpoint's
-  *governing version* that means for a witness that has not seen a new checkpoint in a long
-  time. This crate uses the manifest version that governed the checkpoint at the moment it was
-  cosigned (stored alongside it), which is the interpretation consistent with `ahl-mirror`'s
-  reading of the same clause for its own gap-free-frontier computation.
-- **What "withhold any witness assertion" requires of *future*, unrelated checkpoints is a
-  reading choice.** Core spec §7.3 is explicit that nothing *at or beyond* the equivocation
-  floor may ground an assertion, but does not spell out whether a witness may resume cosigning
-  once fresh, unambiguous checkpoints extend safely past the point of divergence. This crate
-  takes the conservative reading — equivocation is terminal for a log, permanently, once
-  recorded — on the grounds that a witness has no way to determine, from checkpoint metadata
-  alone, which of the two conflicting branches (if either) a later checkpoint is honestly
-  extending; resuming trust could silently make one branch look canonical again, which is
-  exactly what §7.3 forbids. A future revision could define a recovery procedure (e.g. a new
-  manifest version acknowledging the fork); none exists today.
+Two rounds of review against this crate produced core-spec clarifications; recording both what
+was asked and how it was resolved, rather than only the final state, since the earlier rounds'
+reasoning is what a future spec reader needs to know a question was ever open.
+
+- **Bootstrap refusal carries no evidence — confirmed correct.** Adaptor profile §11.2's schema
+  requires both a `retained` and an `offered` checkpoint; the very first checkpoint ever
+  witnessed for a log has no `retained` predecessor, so if its claimed root does not recompute
+  from its own entries there is nothing to pair it with in a two-checkpoint refusal. This crate
+  reports that case as `WitnessError::CheckpointRootMismatch` — an authentication-level failure,
+  not `WitnessOutcome::Refused` — rather than fabricating a placeholder `retained` field. Core
+  spec §3.3 now states this directly: "Before a first checkpoint is retained there is no partner
+  to pair with, so a refusal at bootstrap carries no two-checkpoint evidence and MUST be reported
+  as such rather than fabricating a partner."
+- **Equivocation lockout is permanent — confirmed correct.** Whether a witness could resume
+  cosigning once fresh checkpoints extended safely past a recorded floor was open; this crate
+  took the conservative reading (permanent, no defined recovery) on the grounds that a witness
+  cannot determine, from checkpoint metadata alone, which conflicting branch a later checkpoint
+  honestly extends. Core spec §3.3 now states it directly: "A later well-formed checkpoint does
+  not clear an equivocation record, and a witness MUST NOT resume cosigning a log past its
+  recorded floor."
+- **Grace resolves like cadence — confirmed correct.** `witness_grace_period` is taken from the
+  manifest version governing the checkpoint in question, never the newest version, exactly as
+  `checkpoint_cadence` is (core spec §7.3; §3.3 restates it for grace specifically). This crate
+  already stored cadence and grace alongside each cosigned checkpoint at cosign time for this
+  reason (`store::RetainedCheckpoint`); no change was needed once the rule was made explicit.
+- **Comparing only against the newest retained member misses equivocation — a real defect,
+  fixed.** The first implementation round's `witness_checkpoint` classified an offered checkpoint
+  purely against the single latest retained one. Given cosigned sizes 1, 2, 3, a *conflicting*
+  offered checkpoint at size 2 was classified as a size regression against size 3 — the
+  equivocation at size 2 went undetected. Core spec §3.3 names the fix normatively: "An offered
+  checkpoint whose `(log_id, tree_size)` matches one already cosigned with a different
+  `root_hash` is equivocation, whatever its size relative to the newest retained member." See
+  "Equivocation ends the series" above for the fix, and
+  `witness::tests::equivocation_is_detected_against_full_history_not_only_the_newest_member` for
+  the regression test.
+- **Per-call locking does not make a multi-step decision atomic — a real defect, fixed.** Two
+  concurrent submissions extending the same retained checkpoint to different roots at the same
+  new size could both read the pre-write state, both pass classification, and both be cosigned.
+  Core spec §3.3 now requires the whole transition to be serialized and atomic per log, with an
+  equivocation record persisted atomically with its justifying refusal. See "Serialization and
+  atomicity" above for the fix and its concurrency test.
+- **The refusal reason taxonomy was under-specified and partly unverifiable — redesigned.**
+  Adaptor profile §11.2's `inconsistent` reason covered both size regressions and failed
+  extensions, neither of which a verifier could distinguish or recheck from two root hashes
+  alone. Core spec §3.3 now requires every reason to be independently checkable and forbids
+  emitting one whose verification procedure is undefined. See "Refusal reason taxonomy" above for
+  the three-reason replacement this crate defines and proposes back to the profile.
 
 ## Quality bar
 

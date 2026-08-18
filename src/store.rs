@@ -7,6 +7,28 @@
 //! entries or range proofs (that is `ahl-mirror`'s and any independent mirror's job, core
 //! spec §3.5). Everything written here is already a *verdict*: a cosignature this witness
 //! itself produced, or refusal evidence this witness itself signed.
+//!
+//! # Serialization and atomicity (core spec §3.3, "Obligations that make the machine sound")
+//!
+//! "The retain–verify–classify–cosign transition MUST be serialized per log and atomic. Two
+//! concurrent submissions extending the same retained state to different roots at the same
+//! size MUST NOT both be cosigned; state MUST be re-read inside the critical section, and an
+//! equivocation record MUST be persisted in the same atomic step as the refusal it
+//! justifies."
+//!
+//! [`Store`] holds its connection behind one [`Mutex`], and every public method here acquires
+//! it for the duration of one call — that alone is enough to make any *single* read or write
+//! atomic, but it is **not** enough to make a multi-step decision (read the retained state,
+//! classify a candidate against it, then write the result) atomic as a whole: two threads can
+//! each acquire and release the lock once per step, interleaving between them. The fix is
+//! `Store::with_lock` (crate-private): it exposes the same mutex for the *entire* decision, so
+//! [`crate::witness::witness_checkpoint`] performs every read and the resulting write inside
+//! one critical section, re-reading state itself rather than trusting a value read before the
+//! lock was (re)acquired. The two writes an equivocation discovery requires — the
+//! `equivocations` floor row and its accompanying refusal evidence — are additionally wrapped
+//! in a real `SQLite` transaction (the crate-private `insert_equivocation_and_refusal`) so
+//! they persist together or not at all, independent of the in-process lock (which protects
+//! against concurrent *readers/writers*, not against a crash mid-write).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -14,6 +36,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::checkpoint::Checkpoint;
+use crate::consistency::ConsistencyProofEvidence;
 use crate::error::{WitnessError, WitnessResult};
 use crate::witness::{CosignedCheckpoint, RefusalEvidence, RefusalReason};
 
@@ -35,16 +58,17 @@ CREATE TABLE IF NOT EXISTS cosigned_checkpoints (
     UNIQUE(log_id, tree_size, checkpoint_time)
 );
 CREATE TABLE IF NOT EXISTS refusals (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    log_id      TEXT NOT NULL,
-    witness_id  TEXT NOT NULL,
-    reason      TEXT NOT NULL,
-    retained    TEXT NOT NULL,
-    offered     TEXT NOT NULL,
-    detail      TEXT NOT NULL,
-    refused_at  TEXT NOT NULL,
-    key_id      TEXT NOT NULL,
-    signature   TEXT NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id            TEXT NOT NULL,
+    witness_id        TEXT NOT NULL,
+    reason            TEXT NOT NULL,
+    retained          TEXT NOT NULL,
+    offered           TEXT NOT NULL,
+    consistency_proof TEXT,
+    detail            TEXT NOT NULL,
+    refused_at        TEXT NOT NULL,
+    key_id            TEXT NOT NULL,
+    signature         TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS equivocations (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,13 +161,28 @@ impl Store {
         result
     }
 
+    /// Hold this store's lock for an entire multi-step decision, so every read inside `f`
+    /// observes state no concurrent caller can change until `f` returns, and the write(s) `f`
+    /// performs are indivisible from the caller's perspective (core spec §3.3, "serialize and
+    /// make atomic"). See the module docs for why per-call locking (what every other method
+    /// here does) is not sufficient on its own for a read-classify-write sequence, and see
+    /// [`crate::witness::witness_checkpoint`] for the one caller that needs this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WitnessError::StoreInit`] if the lock is poisoned, or propagates whatever
+    /// `f` returns.
+    pub(crate) fn with_lock<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> WitnessResult<T>,
+    ) -> WitnessResult<T> {
+        self.with_conn(f)
+    }
+
     /// Retain a newly cosigned checkpoint, together with the cadence and grace period that
     /// governed it.
     ///
-    /// Idempotent for a repeated, identical `(log_id, tree_size, checkpoint_time)` — the
-    /// state machine may re-cosign an idempotent republish of an already-retained checkpoint
-    /// (see [`crate::consistency::ConsistencyOutcome::Consistent`] for the equal-size,
-    /// equal-root case).
+    /// Idempotent for a repeated, identical `(log_id, tree_size, checkpoint_time)`.
     ///
     /// # Errors
     ///
@@ -154,52 +193,7 @@ impl Store {
         cadence_nanos: u64,
         grace_nanos: u64,
     ) -> WitnessResult<InsertOutcome> {
-        let cp = &cosigned.checkpoint;
-        let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
-        let cadence_i64 = to_i64("cadence_nanos", cadence_nanos)?;
-        let grace_i64 = to_i64("grace_nanos", grace_nanos)?;
-        self.with_conn(|conn| {
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM cosigned_checkpoints \
-                     WHERE log_id = ?1 AND tree_size = ?2 AND checkpoint_time = ?3 \
-                     AND root_hash = ?4 AND cosignature = ?5",
-                    params![
-                        cp.log_id,
-                        tree_size_i64,
-                        cp.checkpoint_time,
-                        cp.root_hash,
-                        cosigned.cosignature
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if existing.is_some() {
-                return Ok(InsertOutcome::AlreadyPresent);
-            }
-            conn.execute(
-                "INSERT INTO cosigned_checkpoints \
-                 (log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
-                  witness_id, witness_key_id, cosignature, cosigned_at, cadence_nanos, \
-                  grace_nanos) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![
-                    cp.log_id,
-                    tree_size_i64,
-                    cp.root_hash,
-                    cp.checkpoint_time,
-                    cp.key_id,
-                    cp.signature,
-                    cosigned.witness_id,
-                    cosigned.key_id,
-                    cosigned.cosignature,
-                    cosigned.cosigned_at,
-                    cadence_i64,
-                    grace_i64,
-                ],
-            )?;
-            Ok(InsertOutcome::Inserted)
-        })
+        self.with_conn(|conn| insert_cosigned(conn, cosigned, cadence_nanos, grace_nanos))
     }
 
     /// Fetch the latest retained checkpoint for `log_id` — the greatest `(tree_size,
@@ -209,20 +203,22 @@ impl Store {
     ///
     /// Returns [`WitnessError::Store`] on a database failure.
     pub fn get_retained(&self, log_id: &str) -> WitnessResult<Option<RetainedCheckpoint>> {
-        self.with_conn(|conn| {
-            let row = conn
-                .query_row(
-                    "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, \
-                     log_signature, witness_id, witness_key_id, cosignature, cosigned_at, \
-                     cadence_nanos, grace_nanos \
-                     FROM cosigned_checkpoints WHERE log_id = ?1 \
-                     ORDER BY tree_size DESC, checkpoint_time DESC LIMIT 1",
-                    [log_id],
-                    retained_row,
-                )
-                .optional()?;
-            row.transpose()
-        })
+        self.with_conn(|conn| get_retained(conn, log_id))
+    }
+
+    /// Fetch a previously cosigned checkpoint at exactly `tree_size` for `log_id`, if any —
+    /// regardless of whether it is the latest retained member (core spec §3.3, "compare
+    /// against the whole retained history, not the newest member").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WitnessError::Store`] on a database failure.
+    pub fn find_cosigned_at_size(
+        &self,
+        log_id: &str,
+        tree_size: u64,
+    ) -> WitnessResult<Option<RetainedCheckpoint>> {
+        self.with_conn(|conn| find_cosigned_at_size(conn, log_id, tree_size))
     }
 
     /// The complete cosigned history for `log_id`, ascending by `(tree_size,
@@ -251,28 +247,7 @@ impl Store {
     ///
     /// Returns [`WitnessError::Store`] on a database failure.
     pub fn record_refusal(&self, evidence: &RefusalEvidence) -> WitnessResult<()> {
-        let retained_json = serde_json::to_string(&evidence.retained)?;
-        let offered_json = serde_json::to_string(&evidence.offered)?;
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO refusals \
-                 (log_id, witness_id, reason, retained, offered, detail, refused_at, key_id, \
-                  signature) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    evidence.log_id,
-                    evidence.witness_id,
-                    reason_str(evidence.reason),
-                    retained_json,
-                    offered_json,
-                    evidence.detail,
-                    evidence.refused_at,
-                    evidence.key_id,
-                    evidence.signature,
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_conn(|conn| insert_refusal(conn, evidence))
     }
 
     /// Every refusal published for `log_id`, in the order recorded.
@@ -283,131 +258,281 @@ impl Store {
     pub fn list_refusals(&self, log_id: &str) -> WitnessResult<Vec<RefusalEvidence>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT witness_id, reason, retained, offered, detail, refused_at, key_id, \
-                 signature \
+                "SELECT witness_id, reason, retained, offered, consistency_proof, detail, \
+                 refused_at, key_id, signature \
                  FROM refusals WHERE log_id = ?1 ORDER BY id ASC",
             )?;
             let log_id_owned = log_id.to_owned();
-            let rows = stmt.query_map([log_id], move |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    log_id_owned.clone(),
-                ))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (
-                    witness_id,
-                    reason_text,
-                    retained_json,
-                    offered_json,
-                    detail,
-                    refused_at,
-                    key_id,
-                    sig,
-                    lid,
-                ) = row?;
-                let reason = reason_from_str(&reason_text)?;
-                let retained: Checkpoint = serde_json::from_str(&retained_json)?;
-                let offered: Checkpoint = serde_json::from_str(&offered_json)?;
-                out.push(RefusalEvidence {
-                    kind: "witness-refusal".to_owned(),
-                    witness_id,
-                    log_id: lid,
-                    reason,
-                    retained,
-                    offered,
-                    detail,
-                    refused_at,
-                    key_id,
-                    signature: sig,
-                });
-            }
-            Ok(out)
-        })
-    }
-
-    /// Record that `log_id` equivocated at `tree_size` (core spec §7.3, "Equivocation ends
-    /// the series"): two authenticated checkpoints shared this `tree_size` with differing
-    /// `root_hash` values. Idempotent for a repeated report of the same `(log_id, tree_size)`.
-    ///
-    /// The conflicting checkpoints themselves are not duplicated here — they are already
-    /// preserved and published as the accompanying refusal evidence (see
-    /// [`Self::record_refusal`]); this table exists solely to answer "has this log
-    /// equivocated, and from what `tree_size`", which every subsequent witnessing decision
-    /// for the log must consult (see [`crate::witness::witness_checkpoint`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WitnessError::Store`] on a database failure.
-    pub fn record_equivocation(
-        &self,
-        log_id: &str,
-        tree_size: u64,
-        detected_at: &str,
-    ) -> WitnessResult<InsertOutcome> {
-        let tree_size_i64 = to_i64("tree_size", tree_size)?;
-        self.with_conn(|conn| {
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM equivocations WHERE log_id = ?1 AND tree_size = ?2",
-                    params![log_id, tree_size_i64],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if existing.is_some() {
-                return Ok(InsertOutcome::AlreadyPresent);
-            }
-            conn.execute(
-                "INSERT INTO equivocations (log_id, tree_size, detected_at) VALUES (?1, ?2, ?3)",
-                params![log_id, tree_size_i64, detected_at],
-            )?;
-            Ok(InsertOutcome::Inserted)
+            let rows =
+                stmt.query_map([log_id], move |row| Ok(refusal_row(row, log_id_owned.clone())))?;
+            rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
         })
     }
 
     /// The lowest `tree_size` at which `log_id` has been recorded as equivocated, if any.
     /// Core spec §7.3: "From the lowest `tree_size` at which it occurs, the series is no
     /// longer canonical" — nothing at or beyond this floor may ground a witness assertion.
+    /// Core spec §3.3 confirms the floor is **permanent**: no later checkpoint clears it.
     ///
     /// # Errors
     ///
     /// Returns [`WitnessError::Store`] on a database failure.
     pub fn equivocation_floor(&self, log_id: &str) -> WitnessResult<Option<u64>> {
-        self.with_conn(|conn| {
-            let floor: Option<i64> = conn
-                .query_row(
-                    "SELECT MIN(tree_size) FROM equivocations WHERE log_id = ?1",
-                    [log_id],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten();
-            floor.map(|f| to_u64("tree_size", f)).transpose()
-        })
+        self.with_conn(|conn| equivocation_floor(conn, log_id))
     }
+
+    /// The original conflicting pair that established `log_id`'s equivocation floor, if any
+    /// — the earliest-recorded refusal with `reason: Equivocation` (later refusals citing a
+    /// standing floor reuse this same pair; see
+    /// [`crate::witness::witness_checkpoint`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WitnessError::Store`] on a database failure.
+    pub fn original_equivocation_pair(
+        &self,
+        log_id: &str,
+    ) -> WitnessResult<Option<(Checkpoint, Checkpoint)>> {
+        self.with_conn(|conn| original_equivocation_pair(conn, log_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection-level operations.
+//
+// Free functions, not methods: each is called both from a `Store` method above (which wraps
+// exactly one of them in its own `with_conn` lock acquisition) and directly from
+// `crate::witness::witness_checkpoint`, composed together inside a *single*
+// `Store::with_lock` critical section. Keeping the SQL here and the decision logic in
+// `witness.rs` keeps the atomicity fix mechanical: nothing here decides what to do, it only
+// reads and writes what it is told to.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn insert_cosigned(
+    conn: &Connection,
+    cosigned: &CosignedCheckpoint,
+    cadence_nanos: u64,
+    grace_nanos: u64,
+) -> WitnessResult<InsertOutcome> {
+    let cp = &cosigned.checkpoint;
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+    let cadence_i64 = to_i64("cadence_nanos", cadence_nanos)?;
+    let grace_i64 = to_i64("grace_nanos", grace_nanos)?;
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM cosigned_checkpoints \
+             WHERE log_id = ?1 AND tree_size = ?2 AND checkpoint_time = ?3 \
+             AND root_hash = ?4 AND cosignature = ?5",
+            params![
+                cp.log_id,
+                tree_size_i64,
+                cp.checkpoint_time,
+                cp.root_hash,
+                cosigned.cosignature
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Ok(InsertOutcome::AlreadyPresent);
+    }
+    conn.execute(
+        "INSERT INTO cosigned_checkpoints \
+         (log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+          witness_id, witness_key_id, cosignature, cosigned_at, cadence_nanos, grace_nanos) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            cp.log_id,
+            tree_size_i64,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature,
+            cosigned.witness_id,
+            cosigned.key_id,
+            cosigned.cosignature,
+            cosigned.cosigned_at,
+            cadence_i64,
+            grace_i64,
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
+pub(crate) fn get_retained(
+    conn: &Connection,
+    log_id: &str,
+) -> WitnessResult<Option<RetainedCheckpoint>> {
+    conn.query_row(
+        "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, \
+         log_signature, witness_id, witness_key_id, cosignature, cosigned_at, \
+         cadence_nanos, grace_nanos \
+         FROM cosigned_checkpoints WHERE log_id = ?1 \
+         ORDER BY tree_size DESC, checkpoint_time DESC LIMIT 1",
+        [log_id],
+        retained_row,
+    )
+    .optional()?
+    .transpose()
+}
+
+pub(crate) fn find_cosigned_at_size(
+    conn: &Connection,
+    log_id: &str,
+    tree_size: u64,
+) -> WitnessResult<Option<RetainedCheckpoint>> {
+    let tree_size_i64 = to_i64("tree_size", tree_size)?;
+    conn.query_row(
+        "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, \
+         log_signature, witness_id, witness_key_id, cosignature, cosigned_at, \
+         cadence_nanos, grace_nanos \
+         FROM cosigned_checkpoints WHERE log_id = ?1 AND tree_size = ?2 \
+         ORDER BY id ASC LIMIT 1",
+        params![log_id, tree_size_i64],
+        retained_row,
+    )
+    .optional()?
+    .transpose()
+}
+
+pub(crate) fn insert_refusal(conn: &Connection, evidence: &RefusalEvidence) -> WitnessResult<()> {
+    let retained_json = serde_json::to_string(&evidence.retained)?;
+    let offered_json = serde_json::to_string(&evidence.offered)?;
+    let proof_json = evidence.consistency_proof.as_ref().map(serde_json::to_string).transpose()?;
+    conn.execute(
+        "INSERT INTO refusals \
+         (log_id, witness_id, reason, retained, offered, consistency_proof, detail, \
+          refused_at, key_id, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            evidence.log_id,
+            evidence.witness_id,
+            reason_str(evidence.reason),
+            retained_json,
+            offered_json,
+            proof_json,
+            evidence.detail,
+            evidence.refused_at,
+            evidence.key_id,
+            evidence.signature,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn equivocation_floor(conn: &Connection, log_id: &str) -> WitnessResult<Option<u64>> {
+    let floor: Option<i64> = conn
+        .query_row("SELECT MIN(tree_size) FROM equivocations WHERE log_id = ?1", [log_id], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten();
+    floor.map(|f| to_u64("tree_size", f)).transpose()
+}
+
+pub(crate) fn original_equivocation_pair(
+    conn: &Connection,
+    log_id: &str,
+) -> WitnessResult<Option<(Checkpoint, Checkpoint)>> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT retained, offered FROM refusals \
+             WHERE log_id = ?1 AND reason = ?2 ORDER BY id ASC LIMIT 1",
+            params![log_id, reason_str(RefusalReason::Equivocation)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(retained_json, offered_json)| {
+        Ok((serde_json::from_str(&retained_json)?, serde_json::from_str(&offered_json)?))
+    })
+    .transpose()
+}
+
+/// Record that `log_id` equivocated at `tree_size`, and persist the refusal evidence that
+/// justifies it, in one `SQLite` transaction — core spec §3.3: "an equivocation record MUST
+/// be persisted in the same atomic step as the refusal it justifies." Idempotent for a
+/// repeated report of the same `(log_id, tree_size)` floor (the refusal is still inserted:
+/// each refusal is its own signed statement about one candidate).
+///
+/// # Errors
+///
+/// Returns [`WitnessError::Store`] on a database failure.
+pub(crate) fn insert_equivocation_and_refusal(
+    conn: &Connection,
+    log_id: &str,
+    tree_size: u64,
+    detected_at: &str,
+    evidence: &RefusalEvidence,
+) -> WitnessResult<InsertOutcome> {
+    let tree_size_i64 = to_i64("tree_size", tree_size)?;
+    let tx = conn.unchecked_transaction()?;
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM equivocations WHERE log_id = ?1 AND tree_size = ?2",
+            params![log_id, tree_size_i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let outcome = if existing.is_some() {
+        InsertOutcome::AlreadyPresent
+    } else {
+        tx.execute(
+            "INSERT INTO equivocations (log_id, tree_size, detected_at) VALUES (?1, ?2, ?3)",
+            params![log_id, tree_size_i64, detected_at],
+        )?;
+        InsertOutcome::Inserted
+    };
+    insert_refusal(&tx, evidence)?;
+    tx.commit()?;
+    Ok(outcome)
 }
 
 const fn reason_str(reason: RefusalReason) -> &'static str {
     match reason {
-        RefusalReason::Inconsistent => "inconsistent",
-        RefusalReason::MissingConsistencyProof => "missing-consistency-proof",
+        RefusalReason::Equivocation => "equivocation",
+        RefusalReason::SizeRegression => "size-regression",
+        RefusalReason::ExtensionFailed => "extension-failed",
     }
 }
 
 fn reason_from_str(value: &str) -> WitnessResult<RefusalReason> {
     match value {
-        "inconsistent" => Ok(RefusalReason::Inconsistent),
-        "missing-consistency-proof" => Ok(RefusalReason::MissingConsistencyProof),
+        "equivocation" => Ok(RefusalReason::Equivocation),
+        "size-regression" => Ok(RefusalReason::SizeRegression),
+        "extension-failed" => Ok(RefusalReason::ExtensionFailed),
         other => Err(WitnessError::StoreInit(format!("unknown stored refusal reason `{other}`"))),
     }
+}
+
+fn refusal_row(row: &rusqlite::Row<'_>, log_id: String) -> WitnessResult<RefusalEvidence> {
+    let witness_id: String = row.get(0)?;
+    let reason_text: String = row.get(1)?;
+    let retained_json: String = row.get(2)?;
+    let offered_json: String = row.get(3)?;
+    let proof_json: Option<String> = row.get(4)?;
+    let detail: String = row.get(5)?;
+    let refused_at: String = row.get(6)?;
+    let key_id: String = row.get(7)?;
+    let signature: String = row.get(8)?;
+
+    let reason = reason_from_str(&reason_text)?;
+    let retained: Checkpoint = serde_json::from_str(&retained_json)?;
+    let offered: Checkpoint = serde_json::from_str(&offered_json)?;
+    let consistency_proof: Option<ConsistencyProofEvidence> =
+        proof_json.map(|j| serde_json::from_str(&j)).transpose()?;
+    Ok(RefusalEvidence {
+        kind: "witness-refusal".to_owned(),
+        witness_id,
+        log_id,
+        reason,
+        retained,
+        offered,
+        consistency_proof,
+        detail,
+        refused_at,
+        key_id,
+        signature,
+    })
 }
 
 fn retained_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WitnessResult<RetainedCheckpoint>> {
@@ -461,6 +586,22 @@ mod tests {
             key_id: "sha256:bb".to_owned(),
             cosignature: format!("base64:{tree_size}"),
             cosigned_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn refusal(log_id: &str, reason: RefusalReason) -> RefusalEvidence {
+        RefusalEvidence {
+            kind: "witness-refusal".to_owned(),
+            witness_id: "witness-1".to_owned(),
+            log_id: log_id.to_owned(),
+            reason,
+            retained: checkpoint(log_id, 1, "2026-01-01T00:00:00.000000000Z"),
+            offered: checkpoint(log_id, 1, "2026-01-01T00:05:00.000000000Z"),
+            consistency_proof: None,
+            detail: "test".to_owned(),
+            refused_at: "2026-01-01T00:06:00Z".to_owned(),
+            key_id: "sha256:cc".to_owned(),
+            signature: "base64:DEAD".to_owned(),
         }
     }
 
@@ -556,28 +697,49 @@ mod tests {
     }
 
     #[test]
+    fn find_cosigned_at_size_finds_a_non_latest_member() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        store
+            .retain(&cosigned("sha256:aa", 1, "2026-01-01T00:00:00.000000000Z"), 1, 1)
+            .expect("retain");
+        store
+            .retain(&cosigned("sha256:aa", 3, "2026-01-01T00:03:00.000000000Z"), 1, 1)
+            .expect("retain");
+        let found = store.find_cosigned_at_size("sha256:aa", 1).expect("query").expect("present");
+        assert_eq!(found.checkpoint().tree_size, 1);
+        assert!(store.find_cosigned_at_size("sha256:aa", 2).expect("query").is_none());
+    }
+
+    #[test]
     fn refusal_evidence_round_trips() {
         let store = Store::open_in_memory().expect("in-memory store");
-        let evidence = RefusalEvidence {
-            kind: "witness-refusal".to_owned(),
-            witness_id: "witness-1".to_owned(),
-            log_id: "sha256:aa".to_owned(),
-            reason: RefusalReason::Inconsistent,
-            retained: checkpoint("sha256:aa", 1, "2026-01-01T00:00:00.000000000Z"),
-            offered: checkpoint("sha256:aa", 1, "2026-01-01T00:05:00.000000000Z"),
-            detail: "equivocation".to_owned(),
-            refused_at: "2026-01-01T00:06:00Z".to_owned(),
-            key_id: "sha256:cc".to_owned(),
-            signature: "base64:DEAD".to_owned(),
-        };
+        let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store.record_refusal(&evidence).expect("record");
         let listed = store.list_refusals("sha256:aa").expect("query");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].witness_id, "witness-1");
-        assert_eq!(listed[0].reason, RefusalReason::Inconsistent);
+        assert_eq!(listed[0].reason, RefusalReason::Equivocation);
         assert_eq!(listed[0].retained.tree_size, 1);
         assert_eq!(listed[0].offered.checkpoint_time, "2026-01-01T00:05:00.000000000Z");
         assert_eq!(listed[0].signature, "base64:DEAD");
+        assert!(listed[0].consistency_proof.is_none());
+    }
+
+    #[test]
+    fn a_consistency_proof_round_trips_with_the_refusal_that_carries_it() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let mut evidence = refusal("sha256:aa", RefusalReason::ExtensionFailed);
+        evidence.consistency_proof = Some(ConsistencyProofEvidence {
+            from_size: 1,
+            to_size: 4,
+            path: vec![format!("sha256:{}", "aa".repeat(32))],
+        });
+        store.record_refusal(&evidence).expect("record");
+        let listed = store.list_refusals("sha256:aa").expect("query");
+        let proof = listed[0].consistency_proof.as_ref().expect("carried");
+        assert_eq!(proof.from_size, 1);
+        assert_eq!(proof.to_size, 4);
+        assert_eq!(proof.path.len(), 1);
     }
 
     #[test]
@@ -604,40 +766,132 @@ mod tests {
     fn a_fresh_store_has_no_equivocation_floor() {
         let store = Store::open_in_memory().expect("in-memory store");
         assert!(store.equivocation_floor("sha256:aa").expect("query").is_none());
+        assert!(store.original_equivocation_pair("sha256:aa").expect("query").is_none());
     }
 
     #[test]
-    fn recording_an_equivocation_sets_the_floor() {
+    fn recording_an_equivocation_persists_the_floor_and_the_refusal_together() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.record_equivocation("sha256:aa", 5, "2026-01-01T00:00:00Z").expect("record");
+        let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
+        store
+            .with_lock(|conn| {
+                insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    5,
+                    "2026-01-01T00:00:00Z",
+                    &evidence,
+                )
+            })
+            .expect("record");
         assert_eq!(store.equivocation_floor("sha256:aa").expect("query"), Some(5));
+        let (a, b) =
+            store.original_equivocation_pair("sha256:aa").expect("query").expect("present");
+        assert_eq!(a.tree_size, 1);
+        assert_eq!(b.tree_size, 1);
+        assert_eq!(store.list_refusals("sha256:aa").expect("query").len(), 1);
     }
 
     #[test]
     fn the_floor_is_the_lowest_reported_tree_size() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.record_equivocation("sha256:aa", 9, "2026-01-01T00:00:00Z").expect("record");
-        store.record_equivocation("sha256:aa", 3, "2026-01-01T00:01:00Z").expect("record");
+        let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
+        store
+            .with_lock(|conn| {
+                insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    9,
+                    "2026-01-01T00:00:00Z",
+                    &evidence,
+                )
+            })
+            .expect("record");
+        store
+            .with_lock(|conn| {
+                insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    3,
+                    "2026-01-01T00:01:00Z",
+                    &evidence,
+                )
+            })
+            .expect("record");
         assert_eq!(store.equivocation_floor("sha256:aa").expect("query"), Some(3));
     }
 
     #[test]
-    fn repeated_equivocation_reports_are_idempotent() {
+    fn repeated_equivocation_reports_at_the_same_size_are_idempotent_for_the_floor() {
         let store = Store::open_in_memory().expect("in-memory store");
+        let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         assert_eq!(
-            store.record_equivocation("sha256:aa", 5, "2026-01-01T00:00:00Z").expect("first"),
+            store
+                .with_lock(|conn| insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    5,
+                    "2026-01-01T00:00:00Z",
+                    &evidence
+                ))
+                .expect("first"),
             InsertOutcome::Inserted
         );
         assert_eq!(
-            store.record_equivocation("sha256:aa", 5, "2026-01-01T00:00:00Z").expect("repeat"),
+            store
+                .with_lock(|conn| insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    5,
+                    "2026-01-01T00:00:01Z",
+                    &evidence
+                ))
+                .expect("repeat"),
             InsertOutcome::AlreadyPresent
         );
+        // The floor row is deduplicated, but each call still signs and persists its own
+        // refusal — every refusal call is a fresh, independently verifiable statement.
+        assert_eq!(store.list_refusals("sha256:aa").expect("query").len(), 2);
     }
 
     #[test]
     fn equivocation_floors_are_tracked_independently_per_log() {
         let store = Store::open_in_memory().expect("in-memory store");
-        store.record_equivocation("sha256:aa", 5, "2026-01-01T00:00:00Z").expect("record");
+        let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
+        store
+            .with_lock(|conn| {
+                insert_equivocation_and_refusal(
+                    conn,
+                    "sha256:aa",
+                    5,
+                    "2026-01-01T00:00:00Z",
+                    &evidence,
+                )
+            })
+            .expect("record");
         assert!(store.equivocation_floor("sha256:bb").expect("query").is_none());
+    }
+
+    #[test]
+    fn with_lock_composes_multiple_reads_and_a_write_atomically() {
+        // Exercises the exact composition `witness_checkpoint` relies on: several reads and
+        // a write inside one critical section, using the free `pub(crate)` functions
+        // directly rather than the per-call `Store` methods.
+        let store = Store::open_in_memory().expect("in-memory store");
+        let outcome = store
+            .with_lock(|conn| {
+                let _retained = get_retained(conn, "sha256:aa")?;
+                let _at_size = find_cosigned_at_size(conn, "sha256:aa", 1)?;
+                let _floor = equivocation_floor(conn, "sha256:aa")?;
+                insert_cosigned(
+                    conn,
+                    &cosigned("sha256:aa", 1, "2026-01-01T00:00:00.000000000Z"),
+                    1,
+                    1,
+                )
+            })
+            .expect("composed transition");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        assert!(store.get_retained("sha256:aa").expect("query").is_some());
     }
 }

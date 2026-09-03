@@ -54,6 +54,32 @@ pub enum WitnessError {
         tree_size: u64,
     },
 
+    /// A governance statement that is otherwise authentic declares an `ahl_version` this
+    /// revision does not verify — or declares none at all.
+    ///
+    /// I-D §2.2 and §7.1: revision 0.4 verifies no material issued under an earlier revision,
+    /// and §7.5 step 1 orders the read "version first, then parse". A `manifest` or `key`
+    /// statement whose producer signature has already verified under the key set in force is
+    /// therefore read for its declared revision before its content is allowed to establish
+    /// anything, and a statement declaring anything other than [`ahl_core::AHL_VERSION`] is
+    /// refused here rather than skipped: skipping would silently leave the previous governance
+    /// version in force, which is a decision about material this revision has no rules for.
+    /// The check runs only after the signature verifies, so an unsigned or forged entry of type
+    /// `manifest` cannot abort a walk by declaring an old revision.
+    #[error(
+        "governance statement at entry index {entry_index} declares ahl_version `{}`, but this \
+         revision verifies only `{expected}` (I-D §2.2, §7.1)",
+        declared.as_deref().unwrap_or("(absent)")
+    )]
+    UnsupportedStatementVersion {
+        /// The entry index the statement was read at.
+        entry_index: u64,
+        /// The `ahl_version` the statement declared, or `None` if it declared none.
+        declared: Option<String>,
+        /// The revision this build verifies: [`ahl_core::AHL_VERSION`].
+        expected: &'static str,
+    },
+
     /// A configuration's genesis producer key set is empty; no governance chain can ever
     /// start without at least one out-of-band trusted producer key (core spec §2.3.5).
     #[error("configuration declares no genesis producer keys for log `{log_id}`")]

@@ -610,6 +610,7 @@ mod tests {
     ) -> Vec<u8> {
         let payload = serde_json::json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "keys": [
                 { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
@@ -1043,6 +1044,7 @@ mod tests {
         let log_id = format!("sha256:{}", "66".repeat(32));
         let payload = serde_json::json!({
             "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
             "producer": "producer-1",
             "keys": [
                 { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }

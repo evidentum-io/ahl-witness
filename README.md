@@ -183,6 +183,16 @@ without carrying the full range. A witness resolving governance from anything le
 complete `[0, tree_size)` entry sequence could miss a key rotation or a manifest change and
 silently trust a checkpoint signed by a retired key. `governance::resolve` therefore always
 requires the full ordered entry sequence, exactly as `ahl-mirror`'s governance resolution does.
+Resolution also enforces the revision itself: once a `manifest` or `key` statement's producer
+signature verifies under the key set in force, the statement MUST declare the revision this
+build verifies (`ahl_core::AHL_VERSION`, currently `0.4`), and one declaring an earlier
+revision — or none at all — is refused by name (`UnsupportedStatementVersion`) rather than
+skipped as one more unverified candidate, because revision 0.4 verifies no material issued
+under an earlier revision (I-D §2.2, §7.1). Skipping it would silently leave the previous
+governance version in force, which is a ruling on material this revision has no rules for. The
+check runs on every candidate whose envelope verifies, before `predecessor`, `action` or any
+other payload member is read, so an authentic earlier-revision statement cannot slip past it by
+also failing some later check.
 
 ## Duration grammar (core spec §7.3)
 

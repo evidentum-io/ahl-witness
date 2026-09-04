@@ -137,14 +137,15 @@ pub fn parse_iso8601_duration_nanos(value: &str) -> WitnessResult<u64> {
 /// present in `input` (before any other recognised unit letter) is `unit`. Returns the parsed
 /// value and the remainder, or `None` if `input` does not start with a component of this unit.
 fn take_component(input: &str, unit: char) -> WitnessResult<Option<(u64, &str)>> {
-    let Some(pos) = input.find(unit) else { return Ok(None) };
-    let digits = &input[..pos];
+    // `split_once` yields the same two halves a `find` plus range slicing would, and yields
+    // them without an index arithmetic step and without assuming `unit` is one byte wide.
+    let Some((digits, remainder)) = input.split_once(unit) else { return Ok(None) };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(WitnessError::BadDuration { value: input.to_owned() });
     }
     let n: u64 =
         digits.parse().map_err(|_| WitnessError::BadDuration { value: input.to_owned() })?;
-    Ok(Some((n, &input[pos + 1..])))
+    Ok(Some((n, remainder)))
 }
 
 #[cfg(test)]

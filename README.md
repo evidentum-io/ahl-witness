@@ -287,12 +287,45 @@ reconstructs the cosigned object from the six members alone.
 | `/v1/logs/{log_id}/witness` | POST | submit a checkpoint (+ entries) to be witnessed |
 | `/v1/logs/{log_id}/checkpoint` | GET | the latest cosigned checkpoint for this log |
 | `/v1/logs/{log_id}/checkpoints` | GET | the complete cosigned history for this log |
+| `/v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}` | GET | the cosignatures this witness holds over ROTATION-ANCHORING material for the governance-key rotation anchored at that entry index (I-D §7.1); `404` where none is held |
 | `/v1/logs/{log_id}/refusals` | GET | every refusal evidence published for this log |
 | `/v1/logs/{log_id}/freshness` | GET | staleness of the latest cosigned checkpoint |
 
 A verifier can therefore obtain a witnessed checkpoint, or evidence that the log equivocated,
 without going through the log operator at all (core spec §3.3's verifier algorithm: "accept a
 checkpoint C only with a valid witness cosignature").
+
+## Rotation-anchoring checkpoints (I-D §7.1)
+
+A `governance.rotation_proofs[]` checkpoint is a distinct class of material, and this witness
+treats it as one. A submitted checkpoint whose signature does not verify under the manifest
+version active for its own `tree_size` is retried under one rule and one only: the active
+version must be a **governance-key rotation** — its log key objects or its witness key objects
+differ from its predecessor's — the checkpoint's `tree_size` must be GREATER than that version's
+entry index, and the signature must verify under a log key of the PREDECESSOR version's set.
+Nothing else is ever accepted under a retired key, and a checkpoint that fails this second test
+is refused with the failure it earned under the ordinary rule.
+
+Such a checkpoint is then judged under the OUTGOING governance state throughout. This witness's
+own membership is read from that state, not the incoming one: a cosignature by a witness the
+RETIRING manifest version never declared attests nothing about the handover, so where the
+outgoing version does not declare this witness it declines rather than producing a cosignature
+that could never satisfy the rule it exists for. What it cosigns is the same six-member
+projection of adaptor profile §11.1 as any other checkpoint.
+
+The result is retained apart from the series (`rotation_cosignatures`): it never becomes the
+retained checkpoint, never enters the cosigned history a later candidate is checked for
+consistency against, and never grounds a freshness or `ITUB` answer. It is served only from
+`GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`, whose `witnesses` member
+is in the shape of I-D §7.1's `anchoring.witnesses[]` — the shape a
+`governance.rotation_proofs[]` element's own `witnesses` takes — alongside the `checkpoint` those
+cosignatures are over, so the pairing is checkable without a second request.
+
+Held apart is not held outside the rules. Equivocation detection spans both tables in both
+directions: a rotation-anchoring checkpoint offered at a `tree_size` this witness already
+cosigned with a different root, or an ordinary candidate at a size already cosigned as rotation
+material with a different root, is equivocation and is refused with the two-checkpoint evidence
+adaptor profile §11.2 requires, and the resulting floor is permanent for the log.
 
 ## Specification questions raised, and how core spec settled them
 

@@ -30,6 +30,33 @@ pub enum WitnessError {
     #[error("submitted bytes are not JCS-canonical")]
     NotCanonical,
 
+    /// A submitted checkpoint carried a member the cosigned object does not contain (adaptor
+    /// profile §11.1).
+    ///
+    /// Refused rather than dropped: a member deserialized past would leave the submitter
+    /// believing the witness cosigned what it sent, when the preimage the witness signs is the
+    /// six members and nothing else. `raw` is the member this catches in practice, and it has
+    /// a place of its own in the request.
+    #[error(
+        "checkpoint carries `{member}`: the cosigned checkpoint object contains exactly \
+         {{log_id, tree_size, root_hash, checkpoint_time, key_id, signature}} and nothing else \
+         (adaptor profile §11.1), so no other member can be accepted; the §6.4 `raw` framing is \
+         submitted as the request's own top-level `raw`, outside the checkpoint"
+    )]
+    UnknownCheckpointMember {
+        /// The member as submitted.
+        member: String,
+    },
+
+    /// A submission carried a member the witness request shape does not define.
+    #[error(
+        "the witness request carries `{member}`, which is not `checkpoint`, `raw` or `entries`"
+    )]
+    UnknownRequestMember {
+        /// The member as submitted.
+        member: String,
+    },
+
     /// Fewer entries were supplied than the candidate checkpoint's `tree_size` requires to
     /// resolve governance and consistency (adaptor profile §10.6: enumerated governance
     /// requires the full range, since no typed-subset proof exists under this profile).

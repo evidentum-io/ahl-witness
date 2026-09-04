@@ -269,6 +269,15 @@ own polling loop against their `ahl-mirror` instance's `/v1/range` and `/v1/chec
 endpoints. This crate does not ship a bundled poller; wiring one up against a specific mirror's
 authentication and retry policy is a deployment concern.
 
+The submission body is closed on both levels: `{ "checkpoint", "raw", "entries" }` at the top,
+and `{ "log_id", "tree_size", "root_hash", "checkpoint_time", "key_id", "signature" }` inside
+`checkpoint`. Any other member is refused with `400` naming it, rather than deserialized past.
+`raw` belongs at the top level and not inside the checkpoint: adaptor profile §11.1 makes the
+cosigned object exactly those six members, `raw` (§6.4) excluded from the preimage, so a
+checkpoint carrying it describes a submission the witness cannot cosign as sent. A receipt is
+the other direction — I-D §7.1 lets a receipt-borne checkpoint carry `raw`, and a verifier
+reconstructs the cosigned object from the six members alone.
+
 ## Publication interface
 
 | route | method | purpose |

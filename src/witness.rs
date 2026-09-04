@@ -199,8 +199,7 @@ fn cosign_conn(
     candidate: &Checkpoint,
     now_rfc3339: &str,
 ) -> WitnessResult<WitnessOutcome> {
-    let checkpoint_value = serde_json::to_value(candidate)?;
-    let bytes = ahl_core::cosignature_bytes(&checkpoint_value, signer.witness_id());
+    let bytes = ahl_core::cosignature_bytes(&candidate.cosigned()?, signer.witness_id());
     let cosigned = CosignedCheckpoint {
         checkpoint: candidate.clone(),
         witness_id: signer.witness_id().to_owned(),
@@ -325,6 +324,10 @@ pub fn refusal_signing_bytes(evidence: &RefusalEvidence) -> WitnessResult<Vec<u8
 /// Verify a witness cosignature (adaptor profile §11.1) against a specific, already-resolved
 /// witness key.
 ///
+/// The preimage is the six-member projection of adaptor profile §11.1 ([`Checkpoint::cosigned`]),
+/// so a cosignature this witness issued re-verifies here byte for byte, and one issued over any
+/// other rendering of the checkpoint does not.
+///
 /// # Errors
 ///
 /// Propagates a serialization failure (unreachable for a well-formed [`CosignedCheckpoint`])
@@ -333,8 +336,7 @@ pub fn verify_cosignature(
     cosigned: &CosignedCheckpoint,
     witness_key: &ed25519_dalek::VerifyingKey,
 ) -> WitnessResult<bool> {
-    let checkpoint_value = serde_json::to_value(&cosigned.checkpoint)?;
-    let bytes = ahl_core::cosignature_bytes(&checkpoint_value, &cosigned.witness_id);
+    let bytes = ahl_core::cosignature_bytes(&cosigned.checkpoint.cosigned()?, &cosigned.witness_id);
     Ok(ahl_core::verify_signature(witness_key, &bytes, &cosigned.cosignature)?)
 }
 

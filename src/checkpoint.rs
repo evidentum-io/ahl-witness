@@ -21,7 +21,19 @@ const CHECKPOINT_MAGIC: &[u8; 18] = b"ATL-Protocol-v1-CP";
 const CHECKPOINT_BLOB_LEN: usize = 98;
 
 /// A signed AHL checkpoint object (adaptor profile §6.2), field for field.
+///
+/// These six fields are also, exactly, the cosigned object of §11.1 — "contains exactly
+/// `{log_id, tree_size, root_hash, checkpoint_time, key_id, signature}`... and nothing else" —
+/// so a value of this type is by construction cosignable, and [`Checkpoint::cosigned`] maps it
+/// onto [`ahl_core::CosignedCheckpoint`] without a decision of its own.
+///
+/// `deny_unknown_fields` is what makes that hold for material arriving from outside. Serde's
+/// default is to deserialize past a member it does not know, which would let a submission
+/// carrying `raw` — or anything else — be accepted, cosigned over six members, and returned to
+/// a submitter who believes the witness signed what it sent. §11.1 makes any other checkpoint
+/// member `invalid`, and silently dropping one is not a way of refusing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     /// `"sha256:" || hex(Origin ID)`.
     pub log_id: String,
@@ -35,6 +47,24 @@ pub struct Checkpoint {
     pub key_id: String,
     /// `"base64:" || base64(raw 64-byte Ed25519 signature)`.
     pub signature: String,
+}
+
+impl Checkpoint {
+    /// This checkpoint as the six-member object a witness cosigns (adaptor profile §11.1).
+    ///
+    /// The single place the witness crosses into `ahl-core`'s cosignature preimage, so the
+    /// bytes this witness signs and the bytes a verifier reconstructs come from one
+    /// constructor. The round trip through JSON is what `ahl_core::CosignedCheckpoint::project`
+    /// accepts; it cannot fail for a value of this type, whose fields ARE the six members, and
+    /// the error is propagated rather than asserted away because a type is not a proof.
+    ///
+    /// # Errors
+    ///
+    /// [`WitnessError::Json`] if the value does not serialize, or [`WitnessError::Ahl`] if the
+    /// projection rejects it.
+    pub fn cosigned(&self) -> WitnessResult<ahl_core::CosignedCheckpoint> {
+        Ok(ahl_core::CosignedCheckpoint::project(&serde_json::to_value(self)?)?)
+    }
 }
 
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =

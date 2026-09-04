@@ -34,14 +34,15 @@
 //! atomic, but it is **not** enough to make a multi-step decision (read the retained state,
 //! classify a candidate against it, then write the result) atomic as a whole: two threads can
 //! each acquire and release the lock once per step, interleaving between them. The fix is
-//! `Store::with_lock` (crate-private): it exposes the same mutex for the *entire* decision, so
-//! [`crate::witness::witness_checkpoint`] performs every read and the resulting write inside
-//! one critical section, re-reading state itself rather than trusting a value read before the
-//! lock was (re)acquired. The two writes an equivocation discovery requires — the
-//! `equivocations` floor row and its accompanying refusal evidence — are additionally wrapped
-//! in a real `SQLite` transaction (the crate-private `insert_equivocation_and_refusal`) so
-//! they persist together or not at all, independent of the in-process lock (which protects
-//! against concurrent *readers/writers*, not against a crash mid-write).
+//! `Store::with_transaction` (crate-private): it exposes the same mutex for the *entire*
+//! decision, so [`crate::witness::witness_checkpoint`] performs every read and every write it
+//! produces inside one critical section, re-reading state itself rather than trusting a value
+//! read before the lock was (re)acquired — and it wraps those writes in one `SQLite`
+//! transaction, so they persist together or not at all, independent of the in-process lock
+//! (which protects against concurrent *readers/writers*, not against a crash mid-write). One
+//! admission legitimately makes several writes: the retained cosignature, a rotation record per
+//! rotation the checkpoint anchors (I-D §7.1), or an equivocation floor together with the
+//! refusal evidence that justifies it. None of those may land without the others.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -188,22 +189,53 @@ impl Store {
         result
     }
 
-    /// Hold this store's lock for an entire multi-step decision, so every read inside `f`
-    /// observes state no concurrent caller can change until `f` returns, and the write(s) `f`
-    /// performs are indivisible from the caller's perspective (core spec §3.3, "serialize and
-    /// make atomic"). See the module docs for why per-call locking (what every other method
-    /// here does) is not sufficient on its own for a read-classify-write sequence, and see
-    /// [`crate::witness::witness_checkpoint`] for the one caller that needs this.
+    /// Hold this store's lock for an entire multi-step decision AND run every write it makes
+    /// inside one `SQLite` transaction: commit if `f` returns `Ok`, roll back if it returns
+    /// `Err` (core spec §3.3, "serialize and make atomic").
+    ///
+    /// Both halves are load-bearing and neither substitutes for the other. The lock is what
+    /// makes the READS consistent — see the module docs for why per-call locking is not
+    /// sufficient for a read-classify-write sequence. The transaction is what makes the WRITES
+    /// one write: an admission can put a cosignature in `cosigned_checkpoints` and in
+    /// `rotation_cosignatures` at once (I-D §7.1; see [`crate::witness::WitnessOutcome`]), and a
+    /// failure on the second of those must not leave the first standing. A refusal is an `Ok`
+    /// outcome and commits, which is the point — refusal evidence is a verdict this witness owes
+    /// the world, not a failure to write.
+    ///
+    /// `f` MUST use the `&Connection`-based helpers in this module rather than calling back into
+    /// any `&Store` method: the lock is already held here and `std::sync::Mutex` is not
+    /// reentrant, and a nested `BEGIN` is an error in `SQLite`.
     ///
     /// # Errors
     ///
-    /// Returns [`WitnessError::StoreInit`] if the lock is poisoned, or propagates whatever
-    /// `f` returns.
-    pub(crate) fn with_lock<T>(
+    /// [`WitnessError::StoreInit`] if the lock is poisoned, [`WitnessError::Store`] if starting
+    /// or committing the transaction fails, or whatever `f` itself returns (in which case the
+    /// transaction is rolled back before the error propagates).
+    // `significant_drop_tightening` wants the guard dropped as soon as possible, but `tx`
+    // borrows it mutably for its whole lifetime, so it cannot be released before the commit or
+    // rollback — holding it for the whole transaction is exactly the point of this method.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn with_transaction<T>(
         &self,
         f: impl FnOnce(&Connection) -> WitnessResult<T>,
     ) -> WitnessResult<T> {
-        self.with_conn(f)
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| WitnessError::StoreInit("store mutex poisoned".to_owned()))?;
+        let tx = conn.transaction().map_err(WitnessError::from)?;
+        match f(&tx) {
+            Ok(value) => {
+                tx.commit().map_err(WitnessError::from)?;
+                Ok(value)
+            }
+            Err(err) => {
+                // A rollback failure does not leave the writes committed: an uncommitted
+                // `Transaction` also rolls back on drop, so `err` is the right thing to report.
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
     }
 
     /// Retain a newly cosigned checkpoint, together with the cadence and grace period that
@@ -344,7 +376,7 @@ impl Store {
 // Free functions, not methods: each is called both from a `Store` method above (which wraps
 // exactly one of them in its own `with_conn` lock acquisition) and directly from
 // `crate::witness::witness_checkpoint`, composed together inside a *single*
-// `Store::with_lock` critical section. Keeping the SQL here and the decision logic in
+// `Store::with_transaction` critical section. Keeping the SQL here and the decision logic in
 // `witness.rs` keeps the atomicity fix mechanical: nothing here decides what to do, it only
 // reads and writes what it is told to.
 // ---------------------------------------------------------------------------
@@ -649,6 +681,12 @@ pub(crate) fn original_equivocation_pair(
 /// # Errors
 ///
 /// Returns [`WitnessError::Store`] on a database failure.
+/// Record an equivocation floor and the refusal evidence that justifies it.
+///
+/// Core spec §3.3 requires the two to persist together. They do so through the CALLER's
+/// transaction ([`Store::with_transaction`]) rather than one of this function's own: an
+/// admission may already have written a cosignature by the time equivocation is found on a
+/// later step, and a nested `BEGIN` is an error in `SQLite`.
 pub(crate) fn insert_equivocation_and_refusal(
     conn: &Connection,
     log_id: &str,
@@ -657,8 +695,7 @@ pub(crate) fn insert_equivocation_and_refusal(
     evidence: &RefusalEvidence,
 ) -> WitnessResult<InsertOutcome> {
     let tree_size_i64 = to_i64("tree_size", tree_size)?;
-    let tx = conn.unchecked_transaction()?;
-    let existing: Option<i64> = tx
+    let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM equivocations WHERE log_id = ?1 AND tree_size = ?2",
             params![log_id, tree_size_i64],
@@ -668,14 +705,13 @@ pub(crate) fn insert_equivocation_and_refusal(
     let outcome = if existing.is_some() {
         InsertOutcome::AlreadyPresent
     } else {
-        tx.execute(
+        conn.execute(
             "INSERT INTO equivocations (log_id, tree_size, detected_at) VALUES (?1, ?2, ?3)",
             params![log_id, tree_size_i64, detected_at],
         )?;
         InsertOutcome::Inserted
     };
-    insert_refusal(&tx, evidence)?;
-    tx.commit()?;
+    insert_refusal(conn, evidence)?;
     Ok(outcome)
 }
 
@@ -966,7 +1002,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -989,7 +1025,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -1000,7 +1036,7 @@ mod tests {
             })
             .expect("record");
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -1019,7 +1055,7 @@ mod tests {
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         assert_eq!(
             store
-                .with_lock(|conn| insert_equivocation_and_refusal(
+                .with_transaction(|conn| insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
                     5,
@@ -1031,7 +1067,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .with_lock(|conn| insert_equivocation_and_refusal(
+                .with_transaction(|conn| insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
                     5,
@@ -1051,7 +1087,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -1071,7 +1107,7 @@ mod tests {
         // directly rather than the per-call `Store` methods.
         let store = Store::open_in_memory().expect("in-memory store");
         let outcome = store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 let _retained = get_retained(conn, "sha256:aa")?;
                 let _at_size = find_cosigned_at_size(conn, "sha256:aa", 1)?;
                 let _floor = equivocation_floor(conn, "sha256:aa")?;

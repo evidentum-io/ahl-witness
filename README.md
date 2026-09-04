@@ -306,18 +306,26 @@ version whose log key objects or whose witness key objects differ from its prede
 PREDECESSOR version's set, and this witness declared by that predecessor? The search is over
 every such rotation, not merely the active version, because I-D §7.1 says the version active for
 a rotation proof's checkpoint "is the rotating manifest OR A LATER ONE". A submission MAY name
-the rotation it is offered for (`rotation_for`), which changes nothing about what is accepted and
-everything about the report — a named rotation the checkpoint does not anchor is refused with the
-reason. Nothing else is ever accepted under a retired key, and a checkpoint that answers neither
+the rotation it is offered for (`rotation_for`). It narrows nothing: every rotation the
+checkpoint qualifies for is discovered and cosigned either way, because what a checkpoint anchors
+is a fact about the log and not about what the submitter knew. What naming changes is the report
+— a name absent from the discovered set is refused with the reason. Nothing else is ever accepted under a retired key, and a checkpoint that answers neither
 question is refused with the failure it earned under the ordinary rule.
 
 A checkpoint can earn both answers, and the case is not exotic: §7.1 makes a change to the
 witness key objects a rotation on its own, and such a rotation leaves the log key set alone, so
 the ordinary checkpoints of the series are themselves what a `rotation_proofs[]` element needs.
 `POST /v1/logs/{log_id}/witness` therefore reports two facts, `series_member` and
-`rotation_anchors[]`. One cosignature covers both records: the preimage of adaptor profile §11.1
-is the checkpoint and this witness's identity, neither of which depends on which table the result
-is filed in.
+`rotation_anchors[]` — and `rotation_anchors[]` is a list because one checkpoint under an
+unchanged log key can anchor several witness-set rotations at once. One cosignature covers every
+record: the preimage of adaptor profile §11.1 is the checkpoint and this witness's identity,
+neither of which depends on which table the result is filed in.
+
+All of those writes are ONE write. The whole transition — the retained cosignature, every
+rotation record, or an equivocation floor together with the refusal evidence justifying it —
+runs inside one `SQLite` transaction under the store's lock, and any failure rolls back all of
+it. A refusal is an accepted outcome and commits, which is the point: refusal evidence is a
+verdict this witness owes the world, not a failure to write.
 
 Rotation membership is read from the OUTGOING state, not the incoming one: a cosignature by a
 witness the RETIRING manifest version never declared attests nothing about the handover, so where

@@ -17,8 +17,8 @@ use ahl_witness::checkpoint::{checkpoint_blob, Checkpoint};
 use ahl_witness::store::Store;
 use ahl_witness::witness::{witness_checkpoint, WitnessOutcome};
 use ahl_witness_fuzz::{
-    fixture, key_statement_bytes, signed_checkpoint, witness_request_value,
-    GENESIS_CHECKPOINT_TIME, NOW_NANOS,
+    fixture, key_statement_bytes, rotating_manifest_bytes, signed_checkpoint,
+    witness_request_value, GENESIS_CHECKPOINT_TIME, NOW_NANOS,
 };
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -101,6 +101,22 @@ fn run() -> Option<()> {
         "entries": [format!("base64:{}", B64.encode(&fx.genesis_bytes))],
     });
     write_json("witness_request", "04-no-raw-blob.json", &unsigned)?;
+    // The transition exception (I-D §7.1): entry 1 rotates the log key set, and the offered
+    // checkpoint of tree_size 2 is signed by the OUTGOING key, so it fails under the state
+    // active for its own size and is retried under the predecessor's.
+    let rotated = vec![fx.genesis_bytes.clone(), rotating_manifest_bytes()?];
+    let rotation_root = format!(
+        "sha256:{}",
+        hex::encode(atl_core::core::merkle::compute_root(
+            &rotated.iter().map(|b| ahl_witness::metadata::log_leaf_hash(b)).collect::<Vec<_>>()
+        ))
+    );
+    let rotation_cp = checkpoint_claiming(2, &rotation_root, "2026-01-01T00:05:00.000000000Z")?;
+    write_json(
+        "witness_request",
+        "05-rotation-anchoring.json",
+        &request_of(&rotation_cp, &rotated)?,
+    )?;
 
     // --- checkpoint ------------------------------------------------------------------
     let genesis_cp = signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?;
@@ -160,7 +176,7 @@ fn run() -> Option<()> {
                 &serde_json::to_value(&*evidence).ok()?,
             )?;
         }
-        WitnessOutcome::Cosigned(_) => return None,
+        _ => return None,
     }
 
     let equivocation_store = Store::open_in_memory().ok()?;
@@ -188,7 +204,7 @@ fn run() -> Option<()> {
         WitnessOutcome::Refused(evidence) => {
             write_json("refusal", "01-equivocation.json", &serde_json::to_value(&*evidence).ok()?)?;
         }
-        WitnessOutcome::Cosigned(_) => return None,
+        _ => return None,
     }
 
     let cosigned_store = Store::open_in_memory().ok()?;
@@ -210,7 +226,7 @@ fn run() -> Option<()> {
                 &serde_json::to_value(&*checkpoint).ok()?,
             )?;
         }
-        WitnessOutcome::Refused(_) => return None,
+        _ => return None,
     }
 
     // --- config ----------------------------------------------------------------------

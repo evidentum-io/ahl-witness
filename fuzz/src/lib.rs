@@ -97,6 +97,39 @@ pub fn fixture() -> Option<&'static Fixture> {
     FIXTURE.get_or_init(build_fixture).as_ref()
 }
 
+/// A manifest version that ROTATES the log key set, chained to the fixture's genesis manifest.
+///
+/// Anchored at entry index 1, it declares a log checkpoint-signing key the genesis manifest
+/// does not, which is what makes it a governance-key rotation under I-D §7.1 — and therefore
+/// what lets a seed drive the transition exception: a checkpoint of `tree_size` 2 signed by the
+/// genesis (OUTGOING) log key does not verify under this version and is retried under it.
+#[must_use]
+pub fn rotating_manifest_bytes() -> Option<Vec<u8>> {
+    let fx = fixture()?;
+    let rotated = TestKey::from_seed_hex("log-2", &"bb".repeat(32)).ok()?;
+    let payload = json!({
+        "type": "manifest",
+        "ahl_version": ahl_core::AHL_VERSION,
+        "producer": "producer-1",
+        "predecessor": fx.anchor.genesis_manifest_entry_id,
+        "keys": [
+            { "key_id": fx.producer.key_id(), "pubkey": fx.producer.pubkey(), "valid_from_index": 0 }
+        ],
+        "log": {
+            "log_id": fx.anchor.log_id,
+            "operator": "op-1",
+            "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+            "checkpoint_cadence": "PT5M",
+            "cadence_epoch": "2026-01-01T00:00:00Z",
+            "witness_grace_period": "PT1M",
+            "keys": [
+                { "key_id": rotated.key_id(), "pubkey": rotated.pubkey(), "valid_from_index": 0 }
+            ],
+        },
+    });
+    Some(ahl_core::jcs(&ahl_core::envelope(payload, &fx.producer)))
+}
+
 /// Decode a `"base64:"`-prefixed field the same way the HTTP layer does.
 #[must_use]
 pub fn decode_base64_field(value: &str) -> Option<Vec<u8>> {

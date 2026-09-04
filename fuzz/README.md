@@ -4,7 +4,7 @@ Five libFuzzer targets, covering every place the crate reads bytes it did not pr
 
 | target | what it drives |
 | --- | --- |
-| `witness_request` | the body of `POST /v1/logs/{log_id}/witness` — the crate's only request body — through the handler's own extraction and then `witness::witness_checkpoint` |
+| `witness_request` | the body of `POST /v1/logs/{log_id}/witness` — the crate's only request body — through the handler's own extraction and then `witness::witness_checkpoint`, including the I-D §7.1 transition exception, which a seed reaches by carrying a rotating manifest and a checkpoint signed by the outgoing log key |
 | `checkpoint` | a submitted checkpoint object through the §6.3 time grammar, the §6.1 blob assembly and the §6.5 signature check |
 | `governance` | arbitrary bytes as an anchored entry through `governance::resolve`, offered both as entry 0 and after the real genesis, plus the §7.3 duration grammar |
 | `refusal` | published refusal evidence and cosigned checkpoints through the rechecks a verifier runs on them, including the replay of a carried consistency proof |

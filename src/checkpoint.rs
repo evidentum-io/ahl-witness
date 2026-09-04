@@ -40,6 +40,30 @@ pub struct Checkpoint {
 const CHECKPOINT_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z");
 
+/// The literal layout adaptor profile §6.3 fixes, as a mask: `0` stands for "one ASCII
+/// digit here", every other byte for itself.
+const CHECKPOINT_TIME_MASK: &[u8] = b"0000-00-00T00:00:00.000000000Z";
+
+/// Whether `value` has the exact byte layout of §6.3 — the same length, digits where §6.3
+/// puts digits, and the same separators everywhere else.
+///
+/// Checked before `value` reaches a datetime parser, and not only as an optimisation: a
+/// value whose fixed-width subsecond field is cut short by a non-digit drives the parser's
+/// digit combinator into an underflowing subtraction, which aborts the process under
+/// overflow checks. Nothing outside this layout is a §6.3 rendering, so rejecting it here
+/// costs no accepted input.
+fn has_profile_layout(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == CHECKPOINT_TIME_MASK.len()
+        && bytes.iter().zip(CHECKPOINT_TIME_MASK).all(|(byte, mask)| {
+            if *mask == b'0' {
+                byte.is_ascii_digit()
+            } else {
+                byte == mask
+            }
+        })
+}
+
 /// Render a unix-nanosecond value in the exact form adaptor profile §6.3 requires.
 ///
 /// # Errors
@@ -64,6 +88,9 @@ pub fn render_checkpoint_time(nanos: u64) -> WitnessResult<String> {
 /// round-trip back to itself.
 pub fn parse_checkpoint_time(value: &str) -> WitnessResult<u64> {
     let bad = || WitnessError::BadCheckpointTime { value: value.to_owned() };
+    if !has_profile_layout(value) {
+        return Err(bad());
+    }
     let parsed = PrimitiveDateTime::parse(value, CHECKPOINT_TIME_FORMAT).map_err(|_| bad())?;
     let nanos = parsed.assume_utc().unix_timestamp_nanos();
     let nanos = u64::try_from(nanos).map_err(|_| bad())?;
@@ -166,6 +193,27 @@ mod tests {
     fn checkpoint_time_round_trips_at_the_epoch_and_with_trailing_zeros() {
         assert_eq!(render_checkpoint_time(0).expect("epoch"), "1970-01-01T00:00:00.000000000Z");
         assert_eq!(parse_checkpoint_time("1970-01-01T00:00:00.000000000Z").expect("epoch"), 0);
+    }
+
+    /// A non-digit inside the fixed-width subsecond field, which used to reach the datetime
+    /// parser's digit combinator and abort there on a subtraction overflow. Found by the
+    /// `checkpoint` fuzz target and reachable from a submitted checkpoint's
+    /// `checkpoint_time`, so it is a rejection, not an abort. The second case is the shape
+    /// the `witness_request` target reached the same site with.
+    #[test]
+    fn a_non_digit_inside_the_subsecond_field_is_rejected() {
+        assert!(parse_checkpoint_time("2026-01-01T00:00:00.00000/0000Z").is_err());
+        assert!(parse_checkpoint_time("2026-01-01T00:00:00.000+000000Z").is_err());
+    }
+
+    #[test]
+    fn checkpoint_times_outside_the_profile_layout_are_rejected() {
+        // Right length, wrong separators.
+        assert!(parse_checkpoint_time("2026-01-01 00:00:00.000000000Z").is_err());
+        assert!(parse_checkpoint_time("2026/01/01T00:00:00.000000000z").is_err());
+        // A trailing offset instead of `Z`, and a value that is simply too long.
+        assert!(parse_checkpoint_time("2026-01-01T00:00:00.000000000+00:00").is_err());
+        assert!(parse_checkpoint_time("").is_err());
     }
 
     #[test]

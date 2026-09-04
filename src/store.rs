@@ -410,27 +410,60 @@ pub(crate) fn insert_rotation_cosigned(
     let cp = &cosigned.checkpoint;
     let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
     let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
-    let existing: Option<String> = conn
+
+    // The primary key is `(log_id, manifest_entry_index, tree_size, checkpoint_time)`, and two
+    // DIFFERENT checkpoints can share it: a log may sign one tree state at one instant under two
+    // valid keys, and the key id and signature are not part of the key. So the row at that key is
+    // read and compared in full before anything is written — an identical one is idempotent, a
+    // different one is a conflict, and neither is an overwrite. `INSERT OR REPLACE` here would
+    // discard a cosignature this witness had already published over the other checkpoint.
+    let existing = conn
         .query_row(
-            "SELECT cosignature FROM rotation_cosignatures \
-             WHERE log_id = ?1 AND manifest_entry_index = ?2 AND tree_size = ?3 \
-             AND checkpoint_time = ?4 AND root_hash = ?5 AND cosignature = ?6",
-            params![
-                cp.log_id,
-                index_i64,
-                tree_size_i64,
-                cp.checkpoint_time,
-                cp.root_hash,
-                cosigned.cosignature
-            ],
-            |row| row.get(0),
+            "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+             witness_id, witness_key_id, cosignature, cosigned_at \
+             FROM rotation_cosignatures WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+             AND tree_size = ?3 AND checkpoint_time = ?4",
+            params![cp.log_id, index_i64, tree_size_i64, cp.checkpoint_time],
+            cosigned_row,
+        )
+        .optional()?
+        .transpose()?;
+    if let Some(existing) = existing {
+        if &existing == cosigned {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(WitnessError::RotationCosignatureConflict {
+            manifest_entry_index,
+            tree_size: cp.tree_size,
+            checkpoint_time: cp.checkpoint_time.clone(),
+        });
+    }
+
+    // Keep only anchors that could be served. After a rotation that left the LOG key set alone —
+    // I-D §7.1 makes a change to the witness key objects a rotation on its own — every later
+    // checkpoint of the series qualifies as that rotation's anchor, so recording each one would
+    // grow this table with the series to no purpose: the rotation route serves the smallest
+    // `(tree_size, checkpoint_time)` and nothing else. A candidate no earlier than one already
+    // held is therefore superseded rather than stored. What IS stored stays: an earlier candidate
+    // arriving later is recorded beside the one it supersedes, never over it, so what is served
+    // is the minimum over everything ever cosigned and does not depend on arrival order.
+    let held: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT tree_size, checkpoint_time FROM rotation_cosignatures \
+             WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+             ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+            params![cp.log_id, index_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if existing.is_some() {
-        return Ok(InsertOutcome::AlreadyPresent);
+    if let Some((held_size, held_time)) = held {
+        if (held_size, held_time.as_str()) <= (tree_size_i64, cp.checkpoint_time.as_str()) {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
     }
+
     conn.execute(
-        "INSERT OR REPLACE INTO rotation_cosignatures \
+        "INSERT INTO rotation_cosignatures \
          (log_id, manifest_entry_index, tree_size, root_hash, checkpoint_time, log_key_id, \
           log_signature, witness_id, witness_key_id, cosignature, cosigned_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",

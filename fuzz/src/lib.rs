@@ -14,7 +14,7 @@ use ahl_witness::config::{
     Ed25519WitnessSigner, KeyObjectSpec, LogAnchor, LogAnchorSpec, WitnessSigner as _,
 };
 use ahl_witness::store::Store;
-use ahl_witness::witness::witness_checkpoint;
+use ahl_witness::witness::{witness_checkpoint, Submission};
 use atl_core::core::merkle::compute_root;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -166,7 +166,19 @@ pub fn primed_store() -> Option<Store> {
     let store = Store::open_in_memory().ok()?;
     let entries = vec![fx.genesis_bytes.clone()];
     let cp = signed_checkpoint(&entries, GENESIS_CHECKPOINT_TIME)?;
-    witness_checkpoint(&store, &fx.signer, &fx.anchor, &cp, None, &entries, NOW_NANOS).ok()?;
+    witness_checkpoint(
+        &store,
+        &fx.signer,
+        &fx.anchor,
+        &Submission {
+            checkpoint: &cp,
+            raw: None,
+            entries_prefix: &entries,
+            rotation_for: None,
+        },
+        NOW_NANOS,
+    )
+    .ok()?;
     Some(store)
 }
 

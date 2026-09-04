@@ -298,28 +298,42 @@ checkpoint C only with a valid witness cosignature").
 ## Rotation-anchoring checkpoints (I-D §7.1)
 
 A `governance.rotation_proofs[]` checkpoint is a distinct class of material, and this witness
-treats it as one. A submitted checkpoint whose signature does not verify under the manifest
-version active for its own `tree_size` is retried under one rule and one only: the active
-version must be a **governance-key rotation** — its log key objects or its witness key objects
-differ from its predecessor's — the checkpoint's `tree_size` must be GREATER than that version's
-entry index, and the signature must verify under a log key of the PREDECESSOR version's set.
-Nothing else is ever accepted under a retired key, and a checkpoint that fails this second test
-is refused with the failure it earned under the ordinary rule.
+treats it as one. Every submission is asked two independent questions. The ordinary one: does it
+verify under the manifest version active for its own `tree_size`? And the exception: is it
+rotation-anchoring material for any **governance-key rotation** the entry prefix contains — a
+version whose log key objects or whose witness key objects differ from its predecessor's — with
+`tree_size` GREATER than that version's entry index, a signature verifying under a log key of the
+PREDECESSOR version's set, and this witness declared by that predecessor? The search is over
+every such rotation, not merely the active version, because I-D §7.1 says the version active for
+a rotation proof's checkpoint "is the rotating manifest OR A LATER ONE". A submission MAY name
+the rotation it is offered for (`rotation_for`), which changes nothing about what is accepted and
+everything about the report — a named rotation the checkpoint does not anchor is refused with the
+reason. Nothing else is ever accepted under a retired key, and a checkpoint that answers neither
+question is refused with the failure it earned under the ordinary rule.
 
-Such a checkpoint is then judged under the OUTGOING governance state throughout. This witness's
-own membership is read from that state, not the incoming one: a cosignature by a witness the
-RETIRING manifest version never declared attests nothing about the handover, so where the
-outgoing version does not declare this witness it declines rather than producing a cosignature
-that could never satisfy the rule it exists for. What it cosigns is the same six-member
-projection of adaptor profile §11.1 as any other checkpoint.
+A checkpoint can earn both answers, and the case is not exotic: §7.1 makes a change to the
+witness key objects a rotation on its own, and such a rotation leaves the log key set alone, so
+the ordinary checkpoints of the series are themselves what a `rotation_proofs[]` element needs.
+`POST /v1/logs/{log_id}/witness` therefore reports two facts, `series_member` and
+`rotation_anchors[]`. One cosignature covers both records: the preimage of adaptor profile §11.1
+is the checkpoint and this witness's identity, neither of which depends on which table the result
+is filed in.
 
-The result is retained apart from the series (`rotation_cosignatures`): it never becomes the
-retained checkpoint, never enters the cosigned history a later candidate is checked for
-consistency against, and never grounds a freshness or `ITUB` answer. It is served only from
-`GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`, whose `witnesses` member
-is in the shape of I-D §7.1's `anchoring.witnesses[]` — the shape a
-`governance.rotation_proofs[]` element's own `witnesses` takes — alongside the `checkpoint` those
-cosignatures are over, so the pairing is checkable without a second request.
+Rotation membership is read from the OUTGOING state, not the incoming one: a cosignature by a
+witness the RETIRING manifest version never declared attests nothing about the handover, so where
+the outgoing version does not declare this witness it anchors nothing rather than producing a
+cosignature that could never satisfy the rule it exists for. Its ordinary series duties are
+untouched by that, since those are judged under the incoming version.
+
+Rotation records are kept apart from the series (`rotation_cosignatures`): they never become the
+retained checkpoint, never enter the cosigned history a later candidate is checked for
+consistency against, and never ground a freshness or `ITUB` answer. They are served only from
+`GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`, whose `witnesses` member is
+in the shape of I-D §7.1's `anchoring.witnesses[]` — the shape a `governance.rotation_proofs[]`
+element's own `witnesses` takes — alongside the `checkpoint` those cosignatures are over, so the
+pairing is checkable without a second request. Where several checkpoints qualify for one
+rotation, the route serves the smallest `(tree_size, checkpoint_time)`, and the store keeps only
+records that could be served, so which one is served does not depend on arrival order.
 
 Held apart is not held outside the rules. Equivocation detection spans both tables in both
 directions: a rotation-anchoring checkpoint offered at a `tree_size` this witness already

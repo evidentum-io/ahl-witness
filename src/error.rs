@@ -173,6 +173,25 @@ pub enum WitnessError {
         tree_size: u64,
     },
 
+    /// A rotation cosignature is already held for this rotation at the same
+    /// `(tree_size, checkpoint_time)`, over a DIFFERENT checkpoint.
+    ///
+    /// Those four values do not identify a checkpoint — a log may sign one tree state at one
+    /// instant under two valid keys — so the row is compared in full and a genuine collision is
+    /// reported rather than silently overwriting a cosignature this witness already published.
+    #[error(
+        "a rotation cosignature for the manifest at entry index {manifest_entry_index} is \
+         already held at tree_size {tree_size}, {checkpoint_time}, over a different checkpoint"
+    )]
+    RotationCosignatureConflict {
+        /// The rotating manifest's entry index.
+        manifest_entry_index: u64,
+        /// The colliding `tree_size`.
+        tree_size: u64,
+        /// The colliding `checkpoint_time`.
+        checkpoint_time: String,
+    },
+
     /// No rotation cosignature is held for the rotation anchored at this entry index.
     #[error(
         "no rotation cosignature is held for the manifest at entry index {manifest_entry_index}"

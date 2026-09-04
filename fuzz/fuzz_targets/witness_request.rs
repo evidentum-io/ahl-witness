@@ -11,7 +11,7 @@
 #![no_main]
 
 use ahl_witness::checkpoint::Checkpoint;
-use ahl_witness::witness::witness_checkpoint;
+use ahl_witness::witness::{witness_checkpoint, Submission};
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 
@@ -42,6 +42,15 @@ fuzz_target!(|data: &[u8]| {
         decoded.push(bytes);
     }
 
+    // `rotation_for` is optional, and a non-integer is a request rejection in the handler.
+    let rotation_for = match body.get("rotation_for") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(index) => Some(index),
+            None => return,
+        },
+    };
+
     // Primed, so the equivocation, size-regression and extension-failed branches are
     // reachable; fresh per input, so the run is deterministic.
     let Some(store) = ahl_witness_fuzz::primed_store() else { return };
@@ -49,9 +58,12 @@ fuzz_target!(|data: &[u8]| {
         &store,
         &fx.signer,
         &fx.anchor,
-        &checkpoint,
-        raw.as_deref(),
-        &decoded,
+        &Submission {
+            checkpoint: &checkpoint,
+            raw: raw.as_deref(),
+            entries_prefix: &decoded,
+            rotation_for,
+        },
         ahl_witness_fuzz::NOW_NANOS,
     );
 });

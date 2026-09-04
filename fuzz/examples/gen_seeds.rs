@@ -15,7 +15,7 @@ use std::path::Path;
 
 use ahl_witness::checkpoint::{checkpoint_blob, Checkpoint};
 use ahl_witness::store::Store;
-use ahl_witness::witness::{witness_checkpoint, WitnessOutcome};
+use ahl_witness::witness::{witness_checkpoint, Submission, WitnessOutcome};
 use ahl_witness_fuzz::{
     fixture, key_statement_bytes, rotating_manifest_bytes, signed_checkpoint,
     witness_request_value, GENESIS_CHECKPOINT_TIME, NOW_NANOS,
@@ -117,6 +117,18 @@ fn run() -> Option<()> {
         "05-rotation-anchoring.json",
         &request_of(&rotation_cp, &rotated)?,
     )?;
+    // The same submission, NAMING the rotation it is offered for, which is the other way into
+    // the transition exception and the only way to reach its named-mismatch refusals.
+    let mut named = request_of(&rotation_cp, &rotated)?;
+    if let Some(object) = named.as_object_mut() {
+        object.insert("rotation_for".to_owned(), json!(1));
+    }
+    write_json("witness_request", "06-rotation-named.json", &named)?;
+    let mut mismatched = named.clone();
+    if let Some(object) = mismatched.as_object_mut() {
+        object.insert("rotation_for".to_owned(), json!(0));
+    }
+    write_json("witness_request", "07-rotation-named-mismatch.json", &mismatched)?;
 
     // --- checkpoint ------------------------------------------------------------------
     let genesis_cp = signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?;
@@ -152,9 +164,7 @@ fn run() -> Option<()> {
         &store,
         &fx.signer,
         &fx.anchor,
-        &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?,
-        None,
-        &genesis,
+        &Submission { checkpoint: &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?, raw: None, entries_prefix: &genesis, rotation_for: None },
         NOW_NANOS,
     )
     .ok()?;
@@ -162,9 +172,7 @@ fn run() -> Option<()> {
         &store,
         &fx.signer,
         &fx.anchor,
-        &extension_failed,
-        None,
-        &two,
+        &Submission { checkpoint: &extension_failed, raw: None, entries_prefix: &two, rotation_for: None },
         NOW_NANOS,
     )
     .ok()?;
@@ -184,9 +192,7 @@ fn run() -> Option<()> {
         &equivocation_store,
         &fx.signer,
         &fx.anchor,
-        &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?,
-        None,
-        &genesis,
+        &Submission { checkpoint: &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?, raw: None, entries_prefix: &genesis, rotation_for: None },
         NOW_NANOS,
     )
     .ok()?;
@@ -194,9 +200,7 @@ fn run() -> Option<()> {
         &equivocation_store,
         &fx.signer,
         &fx.anchor,
-        &equivocating,
-        None,
-        &genesis,
+        &Submission { checkpoint: &equivocating, raw: None, entries_prefix: &genesis, rotation_for: None },
         NOW_NANOS,
     )
     .ok()?;
@@ -212,14 +216,12 @@ fn run() -> Option<()> {
         &cosigned_store,
         &fx.signer,
         &fx.anchor,
-        &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?,
-        None,
-        &genesis,
+        &Submission { checkpoint: &signed_checkpoint(&genesis, GENESIS_CHECKPOINT_TIME)?, raw: None, entries_prefix: &genesis, rotation_for: None },
         NOW_NANOS,
     )
     .ok()?;
     match cosigned {
-        WitnessOutcome::Cosigned(checkpoint) => {
+        WitnessOutcome::Cosigned { cosigned: checkpoint, .. } => {
             write_json(
                 "refusal",
                 "02-cosigned-checkpoint.json",

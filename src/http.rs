@@ -26,7 +26,7 @@ use crate::error::WitnessError;
 use crate::store::Store;
 use crate::witness::{
     published_checkpoint, witness_checkpoint, CosignedCheckpoint, PublishedCheckpoint,
-    RefusalEvidence, WitnessOutcome,
+    RefusalEvidence, Submission, WitnessOutcome,
 };
 
 /// Shared application state, cheap to clone (every field is `Arc`-backed).
@@ -148,10 +148,19 @@ struct WitnessRequest {
     raw: Option<String>,
     /// Entries covering `[0, checkpoint.tree_size)`, each `"base64:" || base64(JCS(envelope))`.
     entries: Vec<String>,
+    /// The rotating manifest's entry index this checkpoint is offered as ROTATION-ANCHORING
+    /// material for (I-D §7.1), where the submitter names one.
+    ///
+    /// Optional, and naming it changes nothing about what is accepted: this witness detects
+    /// every rotation a checkpoint qualifies for either way. What it changes is the REPORT — a
+    /// named rotation the checkpoint does not in fact anchor is refused with the reason, instead
+    /// of being cosigned as an ordinary series member that anchors nothing.
+    #[serde(default)]
+    rotation_for: Option<u64>,
 }
 
 /// The members a witness submission defines, and the members its checkpoint defines.
-const REQUEST_MEMBERS: [&str; 3] = ["checkpoint", "raw", "entries"];
+const REQUEST_MEMBERS: [&str; 4] = ["checkpoint", "raw", "entries", "rotation_for"];
 const CHECKPOINT_MEMBERS: [&str; 6] =
     ["log_id", "tree_size", "root_hash", "checkpoint_time", "key_id", "signature"];
 
@@ -182,21 +191,20 @@ fn parse_witness_request(body: serde_json::Value) -> Result<WitnessRequest, Witn
 #[derive(Debug, Serialize)]
 #[serde(tag = "status")]
 enum WitnessResponse {
+    /// Cosigned. `series_member` and `rotation_anchors` say which records the one cosignature
+    /// earned: the canonical series, the rotations it anchors under I-D §7.1's transition
+    /// exception, or both. Reported rather than left implicit, because rotation material is
+    /// deliberately absent from the series routes and a submitter told only "cosigned" could
+    /// tell the cases apart only by where the checkpoint later showed up.
     #[serde(rename = "cosigned")]
     Cosigned {
         #[serde(flatten)]
         checkpoint: Box<CosignedCheckpoint>,
-    },
-    /// Cosigned as ROTATION-ANCHORING material under the OUTGOING governance state (I-D
-    /// §7.1). Reported under its own status rather than as an ordinary cosigning, because the
-    /// result is deliberately absent from the series routes: a submitter told only "cosigned"
-    /// would have no way to tell the two apart except by the checkpoint's later absence.
-    #[serde(rename = "cosigned-rotation")]
-    CosignedRotation {
-        /// The entry index of the rotating manifest this checkpoint anchors.
-        manifest_entry_index: u64,
-        #[serde(flatten)]
-        checkpoint: Box<CosignedCheckpoint>,
+        /// Whether it entered the canonical checkpoint series.
+        series_member: bool,
+        /// The rotating-manifest entry indexes it anchors, served from
+        /// `GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`.
+        rotation_anchors: Vec<u64>,
     },
     #[serde(rename = "refused")]
     Refused {
@@ -231,21 +239,25 @@ async fn witness_handler(
             &store,
             signer.as_ref(),
             &anchor,
-            &req.checkpoint,
-            raw.as_deref(),
-            &entries,
+            &Submission {
+                checkpoint: &req.checkpoint,
+                raw: raw.as_deref(),
+                entries_prefix: &entries,
+                rotation_for: req.rotation_for,
+            },
             now,
         )
     })
     .await?;
 
     Ok(match outcome {
-        WitnessOutcome::Cosigned(checkpoint) => {
-            (StatusCode::CREATED, Json(WitnessResponse::Cosigned { checkpoint })).into_response()
-        }
-        WitnessOutcome::CosignedRotation { manifest_entry_index, cosigned } => (
+        WitnessOutcome::Cosigned { cosigned, series_member, rotation_anchors } => (
             StatusCode::CREATED,
-            Json(WitnessResponse::CosignedRotation { manifest_entry_index, checkpoint: cosigned }),
+            Json(WitnessResponse::Cosigned {
+                checkpoint: cosigned,
+                series_member,
+                rotation_anchors,
+            }),
         )
             .into_response(),
         WitnessOutcome::Refused(evidence) => {
@@ -1169,8 +1181,9 @@ mod tests {
 
             let (status, body) = submit(&corpus, &app, &rotation_cp).await;
             assert_eq!(status, StatusCode::CREATED, "{body}");
-            assert_eq!(body["status"], "cosigned-rotation");
-            assert_eq!(body["manifest_entry_index"], ROTATING_INDEX);
+            assert_eq!(body["status"], "cosigned");
+            assert_eq!(body["series_member"], false);
+            assert_eq!(body["rotation_anchors"], json!([ROTATING_INDEX]));
 
             // Served on its own route, in the `anchoring.witnesses[]` element shape.
             let (status, served) = get_json(
@@ -1219,6 +1232,8 @@ mod tests {
             let (status, body) = submit(&corpus, &app, &series_cp).await;
             assert_eq!(status, StatusCode::CREATED, "{body}");
             assert_eq!(body["status"], "cosigned");
+            assert_eq!(body["series_member"], true);
+            assert_eq!(body["rotation_anchors"], json!([]));
             assert_eq!(
                 get_json(&app, &format!("/v1/logs/{}/checkpoint", corpus.log_id)).await.0,
                 StatusCode::OK

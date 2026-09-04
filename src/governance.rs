@@ -446,6 +446,23 @@ fn try_apply_key(
 /// Returns [`WitnessError::GovernanceChainUnresolvable`] if no verified genesis manifest is
 /// reached within `entries_prefix`.
 pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<GovernanceState> {
+    let tree_size = u64::try_from(entries_prefix.len())
+        .map_err(|_| WitnessError::IndexOverflow { what: "entries_prefix.len()" })?;
+    walk(entries_prefix, anchor, None)?
+        .ok_or(WitnessError::GovernanceChainUnresolvable { tree_size })
+}
+
+/// The one walk of `entries_prefix` both [`resolve`] and [`versions`] are views of.
+///
+/// `snapshots`, where given, collects the governance state as each manifest version leaves it —
+/// after phase 3, so a version that failed its checks contributes nothing. A `key` statement
+/// modifies the producer key set and never the log or witness key sets (core spec §2.4.6), so it
+/// is applied to the running state but starts no new version.
+fn walk(
+    entries_prefix: &[Vec<u8>],
+    anchor: &LogAnchor,
+    mut snapshots: Option<&mut Vec<GovernanceState>>,
+) -> WitnessResult<Option<GovernanceState>> {
     let mut state: Option<GovernanceState> = None;
     for (i, bytes) in entries_prefix.iter().enumerate() {
         let index =
@@ -454,7 +471,20 @@ pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<
         let Some(payload) = envelope.get("payload") else { continue };
         let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
         match kind {
-            "manifest" => try_apply_manifest(&mut state, &envelope, payload, index, anchor)?,
+            "manifest" => {
+                let before = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                try_apply_manifest(&mut state, &envelope, payload, index, anchor)?;
+                let after = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                // The governing index moves if and only if a version was actually installed: a
+                // candidate that failed selection, authentication or validation leaves it where
+                // it was, and two versions can never share an index.
+                if before != after {
+                    if let (Some(list), Some(current)) = (snapshots.as_deref_mut(), state.as_ref())
+                    {
+                        list.push(current.clone());
+                    }
+                }
+            }
             "key" => {
                 if let Some(current) = state.as_mut() {
                     try_apply_key(current, &envelope, payload, index)?;
@@ -463,36 +493,34 @@ pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<
             _ => {}
         }
     }
-    let tree_size = u64::try_from(entries_prefix.len())
-        .map_err(|_| WitnessError::IndexOverflow { what: "entries_prefix.len()" })?;
-    state.ok_or(WitnessError::GovernanceChainUnresolvable { tree_size })
+    Ok(state)
 }
 
-/// Walk `entries_prefix` and return the governance state active IMMEDIATELY BEFORE
-/// `entry_index` — the state a manifest anchored AT that index would be replacing.
+/// Every verified manifest VERSION in `entries_prefix`, in ascending entry-index order: the
+/// governance state as each one leaves it, beginning with the genesis manifest.
 ///
-/// This is the OUTGOING state of I-D §7.1's transition exception: "the log key objects of the
-/// manifest version preceding the rotating one". It is the plain walk of [`resolve`] over the
-/// strictly shorter prefix `[0, entry_index)`, named because reading a slice expression at the
-/// call site would leave the reader to reconstruct which state it is.
+/// This is what a rotation search needs and [`resolve`] cannot give. I-D §7.1 defines a
+/// governance-key rotation by comparing a version against ITS PREDECESSOR IN THE CHAIN, and a
+/// `rotation_proofs[]` checkpoint's own active version may be "the rotating manifest or a later
+/// one" — so a checkpoint far past several rotations still has to be matched against each
+/// candidate rotation's own predecessor, not against the state at the end of the prefix.
+/// Consecutive elements here are exactly those (predecessor, rotating) pairs.
 ///
 /// # Errors
 ///
-/// [`WitnessError::IndexOverflow`] if `entry_index` exceeds `entries_prefix`, or
-/// [`WitnessError::GovernanceChainUnresolvable`] if no verified genesis manifest is reached
-/// within that shorter prefix — which is the case for the genesis manifest itself, whose
-/// predecessor state does not exist.
-pub fn resolve_before(
+/// As [`resolve`].
+pub fn versions(
     entries_prefix: &[Vec<u8>],
     anchor: &LogAnchor,
-    entry_index: u64,
-) -> WitnessResult<GovernanceState> {
-    let upto = usize::try_from(entry_index)
-        .map_err(|_| WitnessError::IndexOverflow { what: "manifest entry index" })?;
-    let head = entries_prefix
-        .get(..upto)
-        .ok_or(WitnessError::GovernanceChainUnresolvable { tree_size: entry_index })?;
-    resolve(head, anchor)
+) -> WitnessResult<Vec<GovernanceState>> {
+    let tree_size = u64::try_from(entries_prefix.len())
+        .map_err(|_| WitnessError::IndexOverflow { what: "entries_prefix.len()" })?;
+    let mut collected = Vec::new();
+    walk(entries_prefix, anchor, Some(&mut collected))?;
+    if collected.is_empty() {
+        return Err(WitnessError::GovernanceChainUnresolvable { tree_size });
+    }
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -751,10 +779,11 @@ mod tests {
             ahl_core::jcs(&genesis_env),
             ahl_core::jcs(&manifest(&witness_2, Some(&genesis_id))),
         ];
-        let incoming = resolve(&entries, &anchor).expect("valid successor");
-        let outgoing = resolve_before(&entries, &anchor, 1).expect("predecessor state");
+        let chain = versions(&entries, &anchor).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
         assert_eq!(incoming.governing_manifest_entry_index(), 1);
-        assert!(incoming.rotates(&outgoing), "the witness key objects differ");
+        assert_eq!(outgoing.governing_manifest_entry_index(), 0);
+        assert!(incoming.rotates(outgoing), "the witness key objects differ");
         assert!(outgoing.declares_witness("witness-1", &witness_1.key_id(), 5));
         assert!(!outgoing.declares_witness("witness-1", &witness_2.key_id(), 5));
         assert!(!outgoing.declares_witness("witness-2", &witness_1.key_id(), 5));
@@ -764,9 +793,9 @@ mod tests {
             ahl_core::jcs(&genesis_env),
             ahl_core::jcs(&manifest(&witness_1, Some(&genesis_id))),
         ];
-        let incoming = resolve(&entries, &anchor).expect("valid successor");
-        let outgoing = resolve_before(&entries, &anchor, 1).expect("predecessor state");
-        assert!(!incoming.rotates(&outgoing));
+        let chain = versions(&entries, &anchor).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
+        assert!(!incoming.rotates(outgoing));
     }
 
     /// A `witnesses` member that is present but malformed makes the manifest invalid

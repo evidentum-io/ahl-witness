@@ -131,12 +131,46 @@ async fn witness_key_handler(State(state): State<AppState>) -> Json<WitnessKeyRe
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WitnessRequest {
     checkpoint: Checkpoint,
     /// `"base64:" || base64(the 98-byte blob)` (adaptor profile §6.4), optional.
+    ///
+    /// The framing belongs HERE and not inside `checkpoint`: §11.1 excludes it from the
+    /// cosignature preimage, so carrying it inside the object the witness cosigns would
+    /// describe a submission the witness cannot honour as sent.
     raw: Option<String>,
     /// Entries covering `[0, checkpoint.tree_size)`, each `"base64:" || base64(JCS(envelope))`.
     entries: Vec<String>,
+}
+
+/// The members a witness submission defines, and the members its checkpoint defines.
+const REQUEST_MEMBERS: [&str; 3] = ["checkpoint", "raw", "entries"];
+const CHECKPOINT_MEMBERS: [&str; 6] =
+    ["log_id", "tree_size", "root_hash", "checkpoint_time", "key_id", "signature"];
+
+/// Parse a submission, refusing any member the request or its checkpoint does not define.
+///
+/// `deny_unknown_fields` on the two types already refuses the same material; this runs first so
+/// that the refusal is one of this crate's own errors, NAMING the offending member, rather than
+/// the extractor's generic deserialization rejection. The member matters to whoever sent it:
+/// the case in practice is `raw` placed inside the checkpoint, which is a correct member of a
+/// receipt-borne checkpoint (I-D §7.1) and belongs at the request's top level here, and a
+/// submitter told only "the body did not deserialize" has to guess that.
+fn parse_witness_request(body: serde_json::Value) -> Result<WitnessRequest, WitnessError> {
+    if let Some(members) = body.as_object() {
+        if let Some(extra) = members.keys().find(|m| !REQUEST_MEMBERS.contains(&m.as_str())) {
+            return Err(WitnessError::UnknownRequestMember { member: extra.clone() });
+        }
+        if let Some(checkpoint) = members.get("checkpoint").and_then(serde_json::Value::as_object) {
+            if let Some(extra) =
+                checkpoint.keys().find(|m| !CHECKPOINT_MEMBERS.contains(&m.as_str()))
+            {
+                return Err(WitnessError::UnknownCheckpointMember { member: extra.clone() });
+            }
+        }
+    }
+    Ok(serde_json::from_value(body)?)
 }
 
 #[derive(Debug, Serialize)]
@@ -157,9 +191,10 @@ enum WitnessResponse {
 async fn witness_handler(
     State(state): State<AppState>,
     Path(log_id): Path<String>,
-    Json(req): Json<WitnessRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let anchor = anchor_for(&state.anchors, &log_id)?.clone();
+    let req = parse_witness_request(body).map_err(ApiError::from)?;
     let raw = req
         .raw
         .as_deref()
@@ -584,5 +619,125 @@ mod tests {
             .expect("valid request");
         let response = app.oneshot(request).await.expect("service call");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Post a submission and return `(status, error text)`.
+    async fn refusal_for(hx: &Harness, body: &serde_json::Value) -> (StatusCode, String) {
+        let app = router(hx.state.clone());
+        let request = Request::post(format!("/v1/logs/{}/witness", hx.log_id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).expect("serialize")))
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        let status = response.status();
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        (status, value["error"].as_str().unwrap_or_default().to_owned())
+    }
+
+    /// `raw` inside the checkpoint is the submission the end-to-end pilot sent: a correct
+    /// member of a RECEIPT-borne checkpoint (I-D §7.1), and not a member of the object this
+    /// witness cosigns. Deserializing past it would have the witness cosign six members while
+    /// the submitter believed it had cosigned seven.
+    #[tokio::test]
+    async fn a_checkpoint_carrying_raw_is_refused_and_the_member_is_named() {
+        let hx = harness();
+        let cp = signed_checkpoint(
+            &hx,
+            compute_root(&[hx.genesis_leaf]),
+            "2026-01-01T00:00:00.000000000Z",
+        );
+        let mut body = witness_body(&cp, &[]);
+        body["checkpoint"]["raw"] = json!(format!("base64:{}", B64.encode([0u8; 98])));
+
+        let (status, error) = refusal_for(&hx, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.contains("`raw`"), "the refusal must name the member: {error}");
+        // And it must say where the framing does belong, since `raw` is legitimate material.
+        assert!(error.contains("top-level `raw`"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_checkpoint_member_is_refused_and_named() {
+        let hx = harness();
+        let cp = signed_checkpoint(
+            &hx,
+            compute_root(&[hx.genesis_leaf]),
+            "2026-01-01T00:00:00.000000000Z",
+        );
+        let mut body = witness_body(&cp, &[]);
+        body["checkpoint"]["origin_id"] = json!(hx.log_id.clone());
+
+        let (status, error) = refusal_for(&hx, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.contains("`origin_id`"), "the refusal must name the member: {error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_request_member_is_refused_and_named() {
+        let hx = harness();
+        let cp = signed_checkpoint(
+            &hx,
+            compute_root(&[hx.genesis_leaf]),
+            "2026-01-01T00:00:00.000000000Z",
+        );
+        let mut body = witness_body(&cp, &[]);
+        body["consistency_proof"] = json!([]);
+
+        let (status, error) = refusal_for(&hx, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.contains("`consistency_proof`"), "the refusal must name the member: {error}");
+    }
+
+    /// The whole point of the projection, end to end: what this witness signs is exactly what
+    /// `ahl_core::cosignature_bytes` builds from the six members — including when the verifier
+    /// holds the checkpoint in the RECEIPT-borne form, `raw` and all. A verifier that
+    /// serialised that form as it stands would build different bytes and reject a genuine
+    /// cosignature, which is the defect adaptor §11.1's erratum settles.
+    #[tokio::test]
+    async fn the_cosignature_verifies_over_the_projection_of_a_checkpoint_carrying_raw() {
+        let hx = harness();
+        let app = router(hx.state.clone());
+        let root = compute_root(&[hx.genesis_leaf]);
+        let cp = signed_checkpoint(&hx, root, "2026-01-01T00:00:00.000000000Z");
+        let genesis_bytes = genesis_manifest_bytes(
+            &hx.log_id,
+            &ahl_core::TestKey::from_seed_hex("producer", &"a0".repeat(32)).expect("seed"),
+            &hx.log_key,
+        );
+        let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+        let mut body = witness_body(&cp, &[genesis_bytes]);
+        body["raw"] = json!(format!("base64:{}", B64.encode(blob)));
+
+        let request = Request::post(format!("/v1/logs/{}/witness", hx.log_id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("serialize")))
+            .expect("valid request");
+        let response = app.oneshot(request).await.expect("service call");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let cosigned: CosignedCheckpoint = serde_json::from_slice(&bytes).expect("json");
+
+        // The checkpoint as a RECEIPT carries it: the six members plus the `raw` framing.
+        let mut receipt_borne = serde_json::to_value(&cosigned.checkpoint).expect("serialize");
+        receipt_borne["raw"] = json!(format!("base64:{}", B64.encode(blob)));
+
+        let projected =
+            ahl_core::CosignedCheckpoint::project(&receipt_borne).expect("six members plus raw");
+        let expected = ahl_core::cosignature_bytes(&projected, &cosigned.witness_id);
+        assert_eq!(
+            expected,
+            ahl_core::cosignature_bytes(&cp.cosigned().expect("cosignable"), &cosigned.witness_id),
+            "carrying `raw` must not change the preimage"
+        );
+
+        let witness_key = Ed25519WitnessSigner::from_seed("witness-1", &[3u8; 32])
+            .expect("32 bytes")
+            .verifying_key();
+        assert!(
+            ahl_core::verify_signature(&witness_key, &expected, &cosigned.cosignature)
+                .expect("well-formed signature"),
+            "the cosignature must verify over the six-member projection"
+        );
     }
 }

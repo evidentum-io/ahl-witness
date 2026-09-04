@@ -1,0 +1,33 @@
+{
+  "consistency_proof": {
+    "from_size": 1,
+    "path": [
+      "sha256:a2974c270be84c436aef88e837b22bda624cd7b4c282c5c470469e36e29a724c"
+    ],
+    "to_size": 2
+  },
+  "detail": "a consistency proof from the retained checkpoint to the offered one was generated but did not verify",
+  "key_id": "sha256:dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+  "log_id": "sha256:11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa",
+  "offered": {
+    "checkpoint_time": "2026-01-01T00:05:00.000000000Z",
+    "key_id": "sha256:448f04ffcba874db93d9fd02520daa583a92b1f20b100ff791202a6d7a93e0de",
+    "log_id": "sha256:11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa",
+    "root_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "signature": "base64:xXLIoNUw83MsIoIDraPdGdMb5h7qmpFEn0KykYR9ECjnxdVSbB7t1/gYpU42rO6Q2gBdJwQO3gxjKMkQ4uuKDw==",
+    "tree_size": 2
+  },
+  "reason": "extension-failed",
+  "refused_at": "2026-06-01T00:00:00Z",
+  "retained": {
+    "checkpoint_time": "2026-01-01T00:00:00.000000000Z",
+    "key_id": "sha256:448f04ffcba874db93d9fd02520daa583a92b1f20b100ff791202a6d7a93e0de",
+    "log_id": "sha256:11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa",
+    "root_hash": "sha256:a626fe51538770b858608671266e100445e75b07502c6a770c8507f9d5ed0b53",
+    "signature": "base64:wrRHv19++bouL+u50CczOKQWy6Rf8V6FsUB5PwIXdy+otMp3RFB2xUcl88RQ1xCjcqtfE0KjJOUG6aP4j9jWDQ==",
+    "tree_size": 1
+  },
+  "signature": "base64:YNcxLjZexfM7HWNoK7ZRYKhbrRKVSAmvTbIdbFERhb9vcC7zagCJD0U1X4PsIXhXKdLLLlGvSOZEoB0VZHKmBw==",
+  "type": "witness-refusal",
+  "witness_id": "witness-1"
+}

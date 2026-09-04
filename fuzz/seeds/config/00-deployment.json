@@ -1,0 +1,18 @@
+{
+  "logs": [
+    {
+      "genesis_manifest_entry_id": "sha256:fb96237fa6f8a94e3c174c9121c31828380e13fb5b4c0ed7cd2c6dadfd471b72",
+      "genesis_producer_keys": [
+        {
+          "key_id": "sha256:10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+          "pubkey": "base64:0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+          "valid_from_index": 0
+        }
+      ],
+      "log_id": "sha256:11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa"
+    }
+  ],
+  "signing_key_seed_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+  "store_path": "witness.sqlite3",
+  "witness_id": "witness-1"
+}

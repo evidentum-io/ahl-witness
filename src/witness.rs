@@ -169,6 +169,16 @@ pub enum WitnessOutcome {
     /// The candidate was consistent with the retained checkpoint (or is the first ever
     /// witnessed for this log) and has been cosigned and retained.
     Cosigned(Box<CosignedCheckpoint>),
+    /// The candidate was ROTATION-ANCHORING material (I-D §7.1's transition exception): it
+    /// was judged and cosigned under the OUTGOING governance state, and is retained apart
+    /// from the series — it is not the retained checkpoint, it is not part of the cosigned
+    /// history a later candidate is checked against, and it grounds no freshness answer.
+    CosignedRotation {
+        /// The entry index of the ROTATING manifest this checkpoint anchors.
+        manifest_entry_index: u64,
+        /// The cosignature this witness produced over it.
+        cosigned: Box<CosignedCheckpoint>,
+    },
     /// The candidate conflicted with the retained checkpoint; it was not cosigned, and
     /// signed refusal evidence was published instead.
     Refused(Box<RefusalEvidence>),
@@ -390,6 +400,72 @@ pub fn verify_refusal_claim(evidence: &RefusalEvidence) -> WitnessResult<bool> {
     }
 }
 
+/// Decide whether `candidate` — whose signature did NOT verify under the state active for its
+/// own `tree_size` — is ROTATION-ANCHORING material, and if so under which rotation and which
+/// OUTGOING state.
+///
+/// I-D §7.1 states the exception this implements, and states it narrowly: a
+/// `governance.rotation_proofs[]` checkpoint's `tree_size` "MUST be GREATER than
+/// `manifest_entry_index`", and it "MUST verify under a key of the OUTGOING log key set — the
+/// log key objects of the manifest version preceding the rotating one". The exception "applies
+/// to `rotation_proofs[]` material and to nothing else — never to `anchoring.checkpoint` and
+/// never to `later_checkpoint`."
+///
+/// So this accepts only where ALL of the following hold, and refuses otherwise:
+///
+/// 1. a manifest version is active for `candidate.tree_size` — the version with the greatest
+///    entry index strictly smaller than it;
+/// 2. `candidate.tree_size` is greater than that version's entry index;
+/// 3. that version is a GOVERNANCE-KEY ROTATION of its predecessor — its log key objects or
+///    its witness key objects differ (see [`GovernanceState::rotates`]);
+/// 4. the candidate verifies under a log key of the PREDECESSOR version's set.
+///
+/// It is safe for the reason §7.1 gives: it is "STRICTLY HARDER to satisfy than the general
+/// rule would be", since the general rule would accept the INCOMING key — "exactly the key an
+/// attacker installs" — whereas this accepts only the key being retired.
+fn classify_rotation_anchor(
+    entries_prefix: &[Vec<u8>],
+    anchor: &LogAnchor,
+    incoming: &GovernanceState,
+    candidate: &Checkpoint,
+    raw: Option<&[u8]>,
+) -> WitnessResult<(u64, GovernanceState)> {
+    let manifest_entry_index = incoming.governing_manifest_entry_index();
+    if candidate.tree_size <= manifest_entry_index {
+        return Err(WitnessError::NotRotationMaterial {
+            tree_size: candidate.tree_size,
+            manifest_entry_index,
+            reason: "the checkpoint's tree_size is not greater than the manifest entry index",
+        });
+    }
+    let outgoing = governance::resolve_before(entries_prefix, anchor, manifest_entry_index)?;
+    if !incoming.rotates(&outgoing) {
+        return Err(WitnessError::NotRotationMaterial {
+            tree_size: candidate.tree_size,
+            manifest_entry_index,
+            reason: "the manifest version active for this tree_size is not a governance-key \
+                     rotation of its predecessor",
+        });
+    }
+    let key = outgoing.resolve_log_key(&candidate.key_id, candidate.tree_size)?;
+    verify_checkpoint_signature(candidate, raw, &anchor.log_id, key)?;
+    Ok((manifest_entry_index, outgoing))
+}
+
+/// What one submission was classified as, and the state it is judged under.
+enum Material {
+    /// An ordinary member of the canonical checkpoint series.
+    Series,
+    /// Rotation-anchoring material under I-D §7.1's transition exception.
+    Rotation {
+        /// The entry index of the rotating manifest.
+        manifest_entry_index: u64,
+        /// The OUTGOING governance state — the one being retired, which is the state this
+        /// checkpoint is judged and cosigned under.
+        outgoing: Box<GovernanceState>,
+    },
+}
+
 /// Run the core spec §3.3 state machine on one candidate checkpoint.
 ///
 /// `entries_prefix` MUST cover `[0, candidate.tree_size)` exactly — adaptor profile §10.6:
@@ -429,15 +505,146 @@ pub fn witness_checkpoint(
     // Authentication touches only `entries_prefix` and `anchor` — pure, store-independent —
     // so it is safe and correct to perform before acquiring the store's lock.
     let governance = governance::resolve(entries_prefix, anchor)?;
-    let key = governance.resolve_log_key(&candidate.key_id, candidate.tree_size)?;
-    verify_checkpoint_signature(candidate, raw, &anchor.log_id, key)?;
+    // The ordinary rule first: the key state active for this checkpoint's own `tree_size`
+    // (I-D §7.1's general rule). Only where that fails is the transition exception even
+    // consulted, and where the exception does not apply either, the ORIGINAL failure is what
+    // is reported — a checkpoint that is not rotation material is refused exactly as before,
+    // and naming the rotation rule in its rejection would misdescribe what it failed.
+    let under_incoming = governance
+        .resolve_log_key(&candidate.key_id, candidate.tree_size)
+        .and_then(|key| verify_checkpoint_signature(candidate, raw, &anchor.log_id, key));
+    let material = match under_incoming {
+        Ok(()) => Material::Series,
+        Err(under_incoming_state) => {
+            match classify_rotation_anchor(entries_prefix, anchor, &governance, candidate, raw) {
+                Ok((manifest_entry_index, outgoing)) => {
+                    Material::Rotation { manifest_entry_index, outgoing: Box::new(outgoing) }
+                }
+                Err(_) => return Err(under_incoming_state),
+            }
+        }
+    };
 
     let leaf_hashes: Vec<Hash> = entries_prefix.iter().map(|b| log_leaf_hash(b)).collect();
     let now_rfc3339 = render_rfc3339(now_nanos)?;
 
-    store.with_lock(|conn| {
-        transition(conn, signer, &governance, candidate, &leaf_hashes, &now_rfc3339)
+    store.with_lock(|conn| match &material {
+        Material::Series => {
+            transition(conn, signer, &governance, candidate, &leaf_hashes, &now_rfc3339)
+        }
+        Material::Rotation { manifest_entry_index, outgoing } => rotation_transition(
+            conn,
+            signer,
+            outgoing,
+            candidate,
+            *manifest_entry_index,
+            &leaf_hashes,
+            &now_rfc3339,
+        ),
     })
+}
+
+/// The atomic body of [`witness_checkpoint`] for ROTATION-ANCHORING material.
+///
+/// Deliberately not a branch inside [`transition`]: the series machine's every step — the
+/// retained checkpoint, the consistency proof from it, the size-regression rule — is about
+/// membership of a series this checkpoint is not a member of. What the two DO share is stated
+/// here explicitly rather than inherited: the permanent equivocation floor, and the comparison
+/// against the whole cosigned history at the offered size (core spec §3.3). Held apart is not
+/// held outside those.
+///
+/// Order is load-bearing. Equivocation is checked BEFORE the root is recomputed, because a
+/// second root at a size this witness already vouched for is precisely the case where the root
+/// will not recompute — reporting it as a bad root would throw away the evidence §11.2 requires
+/// this witness to publish.
+fn rotation_transition(
+    conn: &Connection,
+    signer: &dyn WitnessSigner,
+    outgoing: &GovernanceState,
+    candidate: &Checkpoint,
+    manifest_entry_index: u64,
+    leaf_hashes: &[Hash],
+    now_rfc3339: &str,
+) -> WitnessResult<WitnessOutcome> {
+    let log_id = &candidate.log_id;
+
+    // Core spec §3.3: equivocation is permanent, and it is permanent for the LOG, not for one
+    // class of that log's material. Re-read inside this same critical section.
+    if let Some(floor) = store::equivocation_floor(conn, log_id)? {
+        let (original_retained, original_offered) =
+            store::original_equivocation_pair(conn, log_id)?.ok_or_else(|| {
+                WitnessError::StoreInit(
+                    "equivocation floor recorded with no evidence pair".to_owned(),
+                )
+            })?;
+        let detail = format!(
+            "log equivocated at tree_size {floor}; rotation-anchoring candidate at tree_size {} \
+             refused without further evaluation",
+            candidate.tree_size
+        );
+        return refuse_conn(
+            conn,
+            signer,
+            &original_retained,
+            &original_offered,
+            &RefusalKind::Equivocation,
+            &detail,
+            now_rfc3339,
+        );
+    }
+
+    // "Compare against the whole retained history, not the newest member" — both tables.
+    let conflict = match store::find_cosigned_at_size(conn, log_id, candidate.tree_size)? {
+        Some(existing) if existing.cosigned.checkpoint.root_hash != candidate.root_hash => {
+            Some(existing.cosigned.checkpoint)
+        }
+        _ => {
+            store::find_rotation_conflict(conn, log_id, candidate.tree_size, &candidate.root_hash)?
+        }
+    };
+    if let Some(conflict) = conflict {
+        return record_equivocation_and_refuse_conn(
+            conn,
+            signer,
+            candidate.tree_size,
+            &conflict,
+            candidate,
+            now_rfc3339,
+        );
+    }
+
+    // The witness holds the complete entry range for this size (the caller's invariant), so
+    // the root is recomputable and is recomputed: a rotation proof opens an inclusion path
+    // against this root, and a witness that cosigned a root it never checked would be
+    // attesting a tree it had not seen.
+    if compute_root(leaf_hashes) != ahl_core::parse_hash_hex(&candidate.root_hash)? {
+        return Err(WitnessError::CheckpointRootMismatch { tree_size: candidate.tree_size });
+    }
+
+    // I-D §7.1: at L3 a rotation proof's cosignature must verify "under a witness key of the
+    // OUTGOING state". A cosignature by a witness the RETIRING manifest version never declared
+    // attests nothing about the handover, whatever the incoming version says about it — so
+    // this witness's own membership is judged under the outgoing state, and it declines rather
+    // than producing a cosignature that could never satisfy the rule it exists for.
+    let key_id = signer.key_id();
+    if !outgoing.declares_witness(signer.witness_id(), &key_id, candidate.tree_size) {
+        return Err(WitnessError::WitnessNotInOutgoingSet {
+            witness_id: signer.witness_id().to_owned(),
+            key_id,
+            manifest_entry_index,
+        });
+    }
+
+    let bytes = ahl_core::cosignature_bytes(&candidate.cosigned()?, signer.witness_id());
+    let cosigned = CosignedCheckpoint {
+        checkpoint: candidate.clone(),
+        witness_id: signer.witness_id().to_owned(),
+        key_id,
+        cosignature: signer.sign(&bytes),
+        cosigned_at: now_rfc3339.to_owned(),
+    };
+    store::insert_rotation_cosigned(conn, manifest_entry_index, &cosigned)?;
+    Ok(WitnessOutcome::CosignedRotation { manifest_entry_index, cosigned: Box::new(cosigned) })
 }
 
 /// The atomic body of [`witness_checkpoint`]: every read this decision depends on, and the
@@ -478,6 +685,21 @@ fn transition(
     }
 
     // Core spec §3.3: "compare against the whole retained history, not the newest member."
+    // The history is both tables: rotation-anchoring material is served apart from the series
+    // (see [`crate::store`]), but a root this witness cosigned at some size is a root it
+    // cosigned at that size, whichever table it sits in.
+    if let Some(conflict) =
+        store::find_rotation_conflict(conn, log_id, candidate.tree_size, &candidate.root_hash)?
+    {
+        return record_equivocation_and_refuse_conn(
+            conn,
+            signer,
+            candidate.tree_size,
+            &conflict,
+            candidate,
+            now_rfc3339,
+        );
+    }
     if let Some(existing) = store::find_cosigned_at_size(conn, log_id, candidate.tree_size)? {
         let existing_checkpoint = existing.cosigned.checkpoint;
         if existing_checkpoint.root_hash == candidate.root_hash {
@@ -691,6 +913,387 @@ mod tests {
             .expect("well-formed")
     }
 
+    // ---- rotation-anchoring material (I-D §7.1) ----
+
+    /// The witness key seed every fixture's `Ed25519WitnessSigner` uses, as an
+    /// `ahl_core::TestKey` so the manifests can declare the same key object.
+    fn witness_key(seed: u8) -> ahl_core::TestKey {
+        ahl_core::TestKey::from_seed_hex("witness-1", &format!("{seed:02x}").repeat(32))
+            .expect("seed")
+    }
+
+    fn witness_block(key: &ahl_core::TestKey) -> serde_json::Value {
+        serde_json::json!([{
+            "witness_id": "witness-1",
+            "keys": [
+                { "key_id": key.key_id(), "pubkey": key.pubkey(), "valid_from_index": 0 }
+            ],
+        }])
+    }
+
+    fn manifest_bytes(
+        log_id: &str,
+        producer: &ahl_core::TestKey,
+        log_key: &ahl_core::TestKey,
+        predecessor: Option<&str>,
+        witnesses: &serde_json::Value,
+    ) -> Vec<u8> {
+        let mut payload = serde_json::json!({
+            "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
+            "producer": "producer-1",
+            "keys": [
+                { "key_id": producer.key_id(), "pubkey": producer.pubkey(), "valid_from_index": 0 }
+            ],
+            "log": {
+                "log_id": log_id,
+                "operator": "op-1",
+                "adaptor": { "id": "ahl-adaptor-atl-v1", "hash": "sha256:00" },
+                "checkpoint_cadence": "PT5M",
+                "cadence_epoch": "2026-01-01T00:00:00Z",
+                "witness_grace_period": "PT1M",
+                "keys": [
+                    { "key_id": log_key.key_id(), "pubkey": log_key.pubkey(), "valid_from_index": 0 }
+                ],
+            },
+            "witnesses": witnesses,
+        });
+        if let Some(predecessor) = predecessor {
+            payload["predecessor"] = serde_json::json!(predecessor);
+        }
+        ahl_core::jcs(&ahl_core::envelope(payload, producer))
+    }
+
+    /// A log that has performed a log-key rotation: genesis at index 0 under `outgoing`, a
+    /// successor at index 1 replacing the log key set with `incoming`, and one ordinary entry
+    /// at index 2 so a checkpoint can sit past the rotation.
+    struct RotationFixture {
+        store: Store,
+        signer: Ed25519WitnessSigner,
+        anchor: LogAnchor,
+        outgoing: ahl_core::TestKey,
+        incoming: ahl_core::TestKey,
+        entries: Vec<Vec<u8>>,
+        root: Hash,
+    }
+
+    /// The entry index the rotating manifest is anchored at, throughout these fixtures.
+    const ROTATING_INDEX: u64 = 1;
+
+    /// `declare_witness` false makes the OUTGOING version declare no witnesses at all, which
+    /// is the case `a_witness_the_outgoing_version_does_not_declare_declines` needs.
+    fn rotation_fixture(seed: u8, declare_witness: bool) -> RotationFixture {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &format!("{seed:02x}").repeat(32))
+                .expect("seed");
+        let outgoing = ahl_core::TestKey::from_seed_hex(
+            "log-out",
+            &format!("{:02x}", seed.wrapping_add(1)).repeat(32),
+        )
+        .expect("seed");
+        let incoming = ahl_core::TestKey::from_seed_hex(
+            "log-in",
+            &format!("{:02x}", seed.wrapping_add(2)).repeat(32),
+        )
+        .expect("seed");
+        let witness = witness_key(9);
+        let signer =
+            Ed25519WitnessSigner::from_seed("witness-1", &[9u8; 32]).expect("32-byte seed");
+        assert_eq!(signer.key_id(), witness.key_id(), "the fixture declares the signer's key");
+        let log_id = format!("sha256:{}", format!("{seed:02x}").repeat(32));
+
+        let genesis = manifest_bytes(
+            &log_id,
+            &producer,
+            &outgoing,
+            None,
+            &if declare_witness { witness_block(&witness) } else { serde_json::json!([]) },
+        );
+        let genesis_id =
+            ahl_core::entry_id(&serde_json::from_slice(&genesis).expect("well-formed json"));
+        let rotating = manifest_bytes(
+            &log_id,
+            &producer,
+            &incoming,
+            Some(&genesis_id),
+            &witness_block(&witness),
+        );
+        let filler = ahl_core::jcs(&ahl_core::envelope(
+            serde_json::json!({ "type": "ingestion", "ahl_version": ahl_core::AHL_VERSION }),
+            &producer,
+        ));
+        let entries = vec![genesis, rotating, filler];
+        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        let root = compute_root(&leaves);
+
+        let anchor = LogAnchor::resolve(&LogAnchorSpec {
+            log_id,
+            genesis_manifest_entry_id: genesis_id,
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: producer.key_id(),
+                pubkey: producer.pubkey(),
+                valid_from_index: 0,
+            }],
+        })
+        .expect("valid anchor");
+
+        RotationFixture {
+            store: Store::open_in_memory().expect("in-memory store"),
+            signer,
+            anchor,
+            outgoing,
+            incoming,
+            entries,
+            root,
+        }
+    }
+
+    fn rotation_checkpoint(
+        rf: &RotationFixture,
+        key: &ahl_core::TestKey,
+        tree_size: u64,
+        root: Hash,
+        time: &str,
+    ) -> Checkpoint {
+        let mut cp = Checkpoint {
+            log_id: rf.anchor.log_id.clone(),
+            tree_size,
+            root_hash: format!("sha256:{}", hex::encode(root)),
+            checkpoint_time: time.to_owned(),
+            key_id: key.key_id(),
+            signature: String::new(),
+        };
+        let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+        cp.signature = key.sign(&blob);
+        cp
+    }
+
+    fn offer(
+        rf: &RotationFixture,
+        cp: &Checkpoint,
+        at_nanos: u64,
+    ) -> WitnessResult<WitnessOutcome> {
+        witness_checkpoint(&rf.store, &rf.signer, &rf.anchor, cp, None, &rf.entries, at_nanos)
+    }
+
+    /// I-D §7.1: a checkpoint past the rotating index that verifies under the OUTGOING log key
+    /// set is rotation-anchoring material. The witness judges it under the outgoing state and
+    /// cosigns it — and the series is untouched by the whole transaction.
+    #[test]
+    fn an_outgoing_key_checkpoint_past_a_rotation_is_cosigned_under_the_outgoing_state() {
+        let rf = rotation_fixture(0x60, true);
+        let cp =
+            rotation_checkpoint(&rf, &rf.outgoing, 3, rf.root, "2026-01-01T00:02:00.000000000Z");
+
+        let outcome = offer(&rf, &cp, base_nanos()).expect("accepted under the outgoing state");
+        let WitnessOutcome::CosignedRotation { manifest_entry_index, cosigned } = outcome else {
+            panic!("expected rotation material, got {outcome:?}")
+        };
+        assert_eq!(manifest_entry_index, ROTATING_INDEX);
+        assert_eq!(cosigned.checkpoint, cp);
+        assert!(
+            verify_cosignature(&cosigned, &rf.signer.verifying_key()).expect("well-formed"),
+            "the cosignature is over the six-member projection of adaptor profile §11.1"
+        );
+
+        // Served apart, and only there.
+        let held =
+            rf.store.list_rotation_cosignatures(&rf.anchor.log_id, ROTATING_INDEX).expect("query");
+        assert_eq!(held, vec![*cosigned]);
+        assert!(rf
+            .store
+            .list_rotation_cosignatures(&rf.anchor.log_id, 0)
+            .expect("query")
+            .is_empty());
+
+        // The series is untouched: no retained checkpoint, no cosigned history, no freshness.
+        assert!(rf.store.get_retained(&rf.anchor.log_id).expect("query").is_none());
+        assert!(rf.store.list_cosigned(&rf.anchor.log_id).expect("query").is_empty());
+        assert!(matches!(
+            published_checkpoint(&rf.store, &rf.anchor.log_id).expect("query"),
+            PublishedCheckpoint::None
+        ));
+    }
+
+    /// The same log, the same size, the INCOMING key: an ordinary series member, cosigned and
+    /// retained by the general rule, with nothing in the rotation table.
+    #[test]
+    fn an_incoming_key_checkpoint_past_a_rotation_is_an_ordinary_cosign() {
+        let rf = rotation_fixture(0x64, true);
+        let cp =
+            rotation_checkpoint(&rf, &rf.incoming, 3, rf.root, "2026-01-01T00:02:00.000000000Z");
+
+        let outcome = offer(&rf, &cp, base_nanos()).expect("accepted");
+        assert!(matches!(outcome, WitnessOutcome::Cosigned(_)), "got {outcome:?}");
+        assert_eq!(
+            rf.store
+                .get_retained(&rf.anchor.log_id)
+                .expect("query")
+                .map(|r| r.checkpoint().clone()),
+            Some(cp)
+        );
+        assert!(rf
+            .store
+            .list_rotation_cosignatures(&rf.anchor.log_id, ROTATING_INDEX)
+            .expect("query")
+            .is_empty());
+    }
+
+    /// I-D §7.1 requires a rotation proof's `tree_size` to be GREATER than
+    /// `manifest_entry_index`, and it can be because at or below that index the outgoing state
+    /// IS the active state: a checkpoint there needs no exception and gets none.
+    #[test]
+    fn an_outgoing_key_checkpoint_at_or_below_the_rotating_index_is_ordinary() {
+        let rf = rotation_fixture(0x68, true);
+        let genesis_leaf = log_leaf_hash(&rf.entries[0]);
+        let cp = rotation_checkpoint(
+            &rf,
+            &rf.outgoing,
+            ROTATING_INDEX,
+            compute_root(&[genesis_leaf]),
+            "2026-01-01T00:01:00.000000000Z",
+        );
+        // The witness's completeness invariant is per candidate, so this one is offered over
+        // the prefix its own tree_size names.
+        let outcome = witness_checkpoint(
+            &rf.store,
+            &rf.signer,
+            &rf.anchor,
+            &cp,
+            None,
+            &rf.entries[..1],
+            base_nanos(),
+        )
+        .expect("accepted");
+        assert!(matches!(outcome, WitnessOutcome::Cosigned(_)), "got {outcome:?}");
+        assert!(rf
+            .store
+            .list_rotation_cosignatures(&rf.anchor.log_id, ROTATING_INDEX)
+            .expect("query")
+            .is_empty());
+    }
+
+    /// The exception applies only where the active version is a GOVERNANCE-KEY ROTATION. Under
+    /// a version that replaces neither key set, a checkpoint that does not verify is refused
+    /// with THAT failure, not with a rotation diagnosis it never earned.
+    #[test]
+    fn a_checkpoint_failing_under_a_non_rotating_version_is_refused_not_retried() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"6c".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"6d".repeat(32)).expect("seed");
+        let stranger =
+            ahl_core::TestKey::from_seed_hex("stranger", &"6e".repeat(32)).expect("seed");
+        let witness = witness_key(9);
+        let log_id = format!("sha256:{}", "6f".repeat(32));
+
+        let genesis = manifest_bytes(&log_id, &producer, &log_key, None, &witness_block(&witness));
+        let genesis_id =
+            ahl_core::entry_id(&serde_json::from_slice(&genesis).expect("well-formed json"));
+        // Same log key objects, same witness key objects: not a governance-key rotation.
+        let successor = manifest_bytes(
+            &log_id,
+            &producer,
+            &log_key,
+            Some(&genesis_id),
+            &witness_block(&witness),
+        );
+        let entries = vec![genesis, successor];
+        let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+        let root = compute_root(&leaves);
+
+        let anchor = LogAnchor::resolve(&LogAnchorSpec {
+            log_id: log_id.clone(),
+            genesis_manifest_entry_id: genesis_id,
+            genesis_producer_keys: vec![KeyObjectSpec {
+                key_id: producer.key_id(),
+                pubkey: producer.pubkey(),
+                valid_from_index: 0,
+            }],
+        })
+        .expect("valid anchor");
+        let incoming = governance::resolve(&entries, &anchor).expect("governance");
+        let outgoing =
+            governance::resolve_before(&entries, &anchor, ROTATING_INDEX).expect("predecessor");
+        assert!(!incoming.rotates(&outgoing), "neither key set changed");
+
+        let mut cp = Checkpoint {
+            log_id,
+            tree_size: 2,
+            root_hash: format!("sha256:{}", hex::encode(root)),
+            checkpoint_time: "2026-01-01T00:02:00.000000000Z".to_owned(),
+            key_id: stranger.key_id(),
+            signature: String::new(),
+        };
+        cp.signature =
+            stranger.sign(&crate::checkpoint::checkpoint_blob(&cp).expect("well-formed"));
+        assert!(matches!(
+            classify_rotation_anchor(&entries, &anchor, &incoming, &cp, None),
+            Err(WitnessError::NotRotationMaterial { .. })
+        ));
+
+        let store = Store::open_in_memory().expect("in-memory store");
+        let signer = Ed25519WitnessSigner::from_seed("witness-1", &[9u8; 32]).expect("seed");
+        assert!(
+            matches!(
+                witness_checkpoint(&store, &signer, &anchor, &cp, None, &entries, base_nanos()),
+                Err(WitnessError::UnknownSigningKey { .. })
+            ),
+            "refused with the failure it earned under the ordinary rule"
+        );
+    }
+
+    /// I-D §7.1: a rotation proof's cosignature must verify "under a witness key of the
+    /// OUTGOING state". A witness the RETIRING version never declared has no standing to
+    /// attest that version's handover, so it declines rather than producing a cosignature that
+    /// could never satisfy the rule it exists for.
+    #[test]
+    fn a_witness_the_outgoing_version_does_not_declare_declines_to_attest() {
+        let rf = rotation_fixture(0x70, false);
+        let cp =
+            rotation_checkpoint(&rf, &rf.outgoing, 3, rf.root, "2026-01-01T00:02:00.000000000Z");
+        assert!(matches!(
+            offer(&rf, &cp, base_nanos()),
+            Err(WitnessError::WitnessNotInOutgoingSet { manifest_entry_index: ROTATING_INDEX, .. })
+        ));
+        assert!(rf
+            .store
+            .list_rotation_cosignatures(&rf.anchor.log_id, ROTATING_INDEX)
+            .expect("query")
+            .is_empty());
+    }
+
+    /// Held apart is not held outside the rules. A rotation-anchoring checkpoint offered at a
+    /// `tree_size` this witness has already cosigned with a different root is equivocation
+    /// (core spec §3.3), refused with the two-checkpoint evidence §11.2 requires.
+    #[test]
+    fn a_rotation_checkpoint_diverging_from_a_cosigned_member_is_equivocation() {
+        let rf = rotation_fixture(0x74, true);
+        let series =
+            rotation_checkpoint(&rf, &rf.incoming, 3, rf.root, "2026-01-01T00:02:00.000000000Z");
+        assert!(matches!(
+            offer(&rf, &series, base_nanos()).expect("series"),
+            WitnessOutcome::Cosigned(_)
+        ));
+
+        // A rotation-anchoring checkpoint at the same size, over a different root.
+        let diverging =
+            rotation_checkpoint(&rf, &rf.outgoing, 3, [0x33; 32], "2026-01-01T00:03:00.000000000Z");
+        let outcome = offer(&rf, &diverging, base_nanos()).expect("refuses on equivocation");
+        let WitnessOutcome::Refused(evidence) = outcome else {
+            panic!("expected refusal evidence, got {outcome:?}")
+        };
+        assert_eq!(evidence.reason, RefusalReason::Equivocation);
+        assert_eq!(evidence.retained.tree_size, 3);
+        assert_eq!(evidence.offered.tree_size, 3);
+        assert!(verify_refusal_claim(&evidence).expect("well-formed"));
+        assert_eq!(rf.store.equivocation_floor(&rf.anchor.log_id).expect("query"), Some(3));
+        assert!(rf
+            .store
+            .list_rotation_cosignatures(&rf.anchor.log_id, ROTATING_INDEX)
+            .expect("query")
+            .is_empty());
+    }
+
     #[test]
     fn the_first_checkpoint_for_a_log_is_cosigned_on_a_matching_root() {
         let fx = fixture("11", "aa");
@@ -714,7 +1317,7 @@ mod tests {
                 let key = fx.signer.verifying_key();
                 assert!(verify_cosignature(&cosigned, &key).expect("well-formed"));
             }
-            WitnessOutcome::Refused(_) => panic!("expected a cosign on the first checkpoint"),
+            other => panic!("expected a cosign on the first checkpoint, got {other:?}"),
         }
     }
 
@@ -819,7 +1422,7 @@ mod tests {
                 let key = fx.signer.verifying_key();
                 assert!(verify_refusal_signature(&evidence, &key).expect("well-formed"));
             }
-            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
         // The retained checkpoint is unchanged.
         let retained = fx.store.get_retained(&fx.anchor.log_id).expect("query").expect("present");
@@ -855,7 +1458,7 @@ mod tests {
                 assert!(evidence.consistency_proof.is_none());
                 assert!(verify_refusal_claim(&evidence).expect("well-formed"));
             }
-            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
 
         // Core spec §3.3: once equivocation is recorded, the floor is permanent for this log.
@@ -935,7 +1538,7 @@ mod tests {
                 assert_eq!(evidence.retained.tree_size, 2);
                 assert_eq!(evidence.offered.tree_size, 2);
             }
-            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(fx.store.equivocation_floor(&fx.anchor.log_id).expect("query"), Some(2));
         // The size-3 checkpoint, cosigned before the conflict was found, remains on record,
@@ -1031,7 +1634,7 @@ mod tests {
                 assert!(verify_refusal_claim(&evidence).expect("well-formed"));
                 assert!(evidence.detail.contains("tree_size 2"));
             }
-            WitnessOutcome::Cosigned(_) => panic!("expected a refusal"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
         // Still not cosigned or retained.
         let retained = fx.store.get_retained(&fx.anchor.log_id).expect("query").expect("present");
@@ -1245,7 +1848,7 @@ mod tests {
             .into_iter()
             .find_map(|o| match o {
                 WitnessOutcome::Refused(evidence) => Some(evidence),
-                WitnessOutcome::Cosigned(_) => None,
+                _ => None,
             })
             .expect("exactly one refusal");
         assert_eq!(refused.reason, RefusalReason::Equivocation);

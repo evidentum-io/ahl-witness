@@ -2,6 +2,19 @@
 //! cosigned-checkpoint history, and published refusal evidence (core spec §3.3; adaptor
 //! profile §11).
 //!
+//! # Rotation cosignatures are stored apart
+//!
+//! `rotation_cosignatures` is a second, separate table, and separateness is the point. A
+//! rotation-anchoring checkpoint verifies under the OUTGOING governance state rather than the
+//! state active for its own `tree_size` (I-D §7.1's transition exception), so it is not a
+//! member of the series this witness tracks: it never becomes the retained checkpoint, never
+//! enters the cosigned history a later candidate is checked for consistency against, and never
+//! grounds a freshness answer. Holding it in `cosigned_checkpoints` and filtering on read would
+//! make every one of those call sites responsible for remembering the distinction; holding it
+//! apart means none of them can forget. What the two DO share is equivocation detection: a
+//! rotation-anchoring checkpoint offered at a `tree_size` this witness has already cosigned
+//! with a different root is equivocation like any other, and is refused with evidence.
+//!
 //! Unlike `ahl-mirror`'s store, this one holds no entry bytes and no candidate material —
 //! a witness's job is narrower (verify and cosign or refuse, core spec §3.3), not to serve
 //! entries or range proofs (that is `ahl-mirror`'s and any independent mirror's job, core
@@ -56,6 +69,20 @@ CREATE TABLE IF NOT EXISTS cosigned_checkpoints (
     cadence_nanos   INTEGER NOT NULL,
     grace_nanos     INTEGER NOT NULL,
     UNIQUE(log_id, tree_size, checkpoint_time)
+);
+CREATE TABLE IF NOT EXISTS rotation_cosignatures (
+    log_id               TEXT NOT NULL,
+    manifest_entry_index INTEGER NOT NULL,
+    tree_size            INTEGER NOT NULL,
+    root_hash            TEXT NOT NULL,
+    checkpoint_time      TEXT NOT NULL,
+    log_key_id           TEXT NOT NULL,
+    log_signature        TEXT NOT NULL,
+    witness_id           TEXT NOT NULL,
+    witness_key_id       TEXT NOT NULL,
+    cosignature          TEXT NOT NULL,
+    cosigned_at          TEXT NOT NULL,
+    PRIMARY KEY (log_id, manifest_entry_index, tree_size, checkpoint_time)
 );
 CREATE TABLE IF NOT EXISTS refusals (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,6 +277,20 @@ impl Store {
         self.with_conn(|conn| insert_refusal(conn, evidence))
     }
 
+    /// Every rotation cosignature this witness holds for the rotation anchored at
+    /// `manifest_entry_index`, oldest checkpoint first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WitnessError::Store`] on a database failure.
+    pub fn list_rotation_cosignatures(
+        &self,
+        log_id: &str,
+        manifest_entry_index: u64,
+    ) -> WitnessResult<Vec<CosignedCheckpoint>> {
+        self.with_conn(|conn| list_rotation_cosigned(conn, log_id, manifest_entry_index))
+    }
+
     /// Every refusal published for `log_id`, in the order recorded.
     ///
     /// # Errors
@@ -359,6 +400,97 @@ pub(crate) fn insert_cosigned(
     Ok(InsertOutcome::Inserted)
 }
 
+/// Record a cosignature over ROTATION-ANCHORING material, apart from the series (see the
+/// module docs). Idempotent for an identical resubmission.
+pub(crate) fn insert_rotation_cosigned(
+    conn: &Connection,
+    manifest_entry_index: u64,
+    cosigned: &CosignedCheckpoint,
+) -> WitnessResult<InsertOutcome> {
+    let cp = &cosigned.checkpoint;
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT cosignature FROM rotation_cosignatures \
+             WHERE log_id = ?1 AND manifest_entry_index = ?2 AND tree_size = ?3 \
+             AND checkpoint_time = ?4 AND root_hash = ?5 AND cosignature = ?6",
+            params![
+                cp.log_id,
+                index_i64,
+                tree_size_i64,
+                cp.checkpoint_time,
+                cp.root_hash,
+                cosigned.cosignature
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Ok(InsertOutcome::AlreadyPresent);
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO rotation_cosignatures \
+         (log_id, manifest_entry_index, tree_size, root_hash, checkpoint_time, log_key_id, \
+          log_signature, witness_id, witness_key_id, cosignature, cosigned_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            cp.log_id,
+            index_i64,
+            tree_size_i64,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature,
+            cosigned.witness_id,
+            cosigned.key_id,
+            cosigned.cosignature,
+            cosigned.cosigned_at,
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
+/// Every rotation cosignature this witness holds for one rotation, oldest checkpoint first.
+pub(crate) fn list_rotation_cosigned(
+    conn: &Connection,
+    log_id: &str,
+    manifest_entry_index: u64,
+) -> WitnessResult<Vec<CosignedCheckpoint>> {
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let mut stmt = conn.prepare(
+        "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+         witness_id, witness_key_id, cosignature, cosigned_at \
+         FROM rotation_cosignatures WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+         ORDER BY tree_size ASC, checkpoint_time ASC",
+    )?;
+    let rows = stmt.query_map(params![log_id, index_i64], cosigned_row)?;
+    rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
+}
+
+/// Read a [`CosignedCheckpoint`] from the ten columns the rotation table selects.
+fn cosigned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WitnessResult<CosignedCheckpoint>> {
+    let tree_size: i64 = row.get(1)?;
+    let checkpoint = Checkpoint {
+        log_id: row.get(0)?,
+        tree_size: match u64::try_from(tree_size) {
+            Ok(value) => value,
+            Err(_) => return Ok(Err(WitnessError::IndexOverflow { what: "tree_size" })),
+        },
+        root_hash: row.get(2)?,
+        checkpoint_time: row.get(3)?,
+        key_id: row.get(4)?,
+        signature: row.get(5)?,
+    };
+    Ok(Ok(CosignedCheckpoint {
+        checkpoint,
+        witness_id: row.get(6)?,
+        key_id: row.get(7)?,
+        cosignature: row.get(8)?,
+        cosigned_at: row.get(9)?,
+    }))
+}
+
 pub(crate) fn get_retained(
     conn: &Connection,
     log_id: &str,
@@ -393,6 +525,33 @@ pub(crate) fn find_cosigned_at_size(
     )
     .optional()?
     .transpose()
+}
+
+/// A checkpoint this witness has already cosigned at `tree_size` whose root DIFFERS from
+/// `root_hash`, drawn from the rotation table.
+///
+/// The series table has its own lookup ([`find_cosigned_at_size`]); this is the other half, so
+/// that "compare against the whole retained history" (core spec §3.3) means the whole of it and
+/// not the series alone. Material held apart from the series is still material this witness
+/// vouched for at that size.
+pub(crate) fn find_rotation_conflict(
+    conn: &Connection,
+    log_id: &str,
+    tree_size: u64,
+    root_hash: &str,
+) -> WitnessResult<Option<Checkpoint>> {
+    let tree_size_i64 = to_i64("tree_size", tree_size)?;
+    let found = conn
+        .query_row(
+            "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+             witness_id, witness_key_id, cosignature, cosigned_at \
+             FROM rotation_cosignatures WHERE log_id = ?1 AND tree_size = ?2 AND root_hash <> ?3 \
+             ORDER BY checkpoint_time ASC LIMIT 1",
+            params![log_id, tree_size_i64, root_hash],
+            cosigned_row,
+        )
+        .optional()?;
+    found.transpose().map(|found| found.map(|cosigned| cosigned.checkpoint))
 }
 
 pub(crate) fn insert_refusal(conn: &Connection, evidence: &RefusalEvidence) -> WitnessResult<()> {

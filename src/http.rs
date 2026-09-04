@@ -48,6 +48,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/logs/{log_id}/witness", post(witness_handler))
         .route("/v1/logs/{log_id}/checkpoint", get(latest_checkpoint_handler))
         .route("/v1/logs/{log_id}/checkpoints", get(history_handler))
+        .route(
+            "/v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}",
+            get(rotation_cosignatures_handler),
+        )
         .route("/v1/logs/{log_id}/refusals", get(refusals_handler))
         .route("/v1/logs/{log_id}/freshness", get(freshness_handler))
         .with_state(state)
@@ -70,7 +74,9 @@ impl From<WitnessError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            WitnessError::UnknownLog { .. } => StatusCode::NOT_FOUND,
+            WitnessError::UnknownLog { .. } | WitnessError::UnknownRotationCosignature { .. } => {
+                StatusCode::NOT_FOUND
+            }
             WitnessError::Store(_)
             | WitnessError::StoreInit(_)
             | WitnessError::IndexOverflow { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -181,6 +187,17 @@ enum WitnessResponse {
         #[serde(flatten)]
         checkpoint: Box<CosignedCheckpoint>,
     },
+    /// Cosigned as ROTATION-ANCHORING material under the OUTGOING governance state (I-D
+    /// §7.1). Reported under its own status rather than as an ordinary cosigning, because the
+    /// result is deliberately absent from the series routes: a submitter told only "cosigned"
+    /// would have no way to tell the two apart except by the checkpoint's later absence.
+    #[serde(rename = "cosigned-rotation")]
+    CosignedRotation {
+        /// The entry index of the rotating manifest this checkpoint anchors.
+        manifest_entry_index: u64,
+        #[serde(flatten)]
+        checkpoint: Box<CosignedCheckpoint>,
+    },
     #[serde(rename = "refused")]
     Refused {
         #[serde(flatten)]
@@ -226,6 +243,11 @@ async fn witness_handler(
         WitnessOutcome::Cosigned(checkpoint) => {
             (StatusCode::CREATED, Json(WitnessResponse::Cosigned { checkpoint })).into_response()
         }
+        WitnessOutcome::CosignedRotation { manifest_entry_index, cosigned } => (
+            StatusCode::CREATED,
+            Json(WitnessResponse::CosignedRotation { manifest_entry_index, checkpoint: cosigned }),
+        )
+            .into_response(),
         WitnessOutcome::Refused(evidence) => {
             (StatusCode::CONFLICT, Json(WitnessResponse::Refused { evidence })).into_response()
         }
@@ -284,6 +306,69 @@ async fn history_handler(
     let store = Arc::clone(&state.store);
     let history = blocking(move || store.list_cosigned(&log_id)).await?;
     Ok(Json(history.into_iter().map(|r| r.cosigned).collect()))
+}
+
+/// The cosignatures this witness holds over rotation-anchoring material for one rotation.
+///
+/// The `witnesses` member is in the shape of I-D §7.1's `anchoring.witnesses[]` — the same
+/// shape a `governance.rotation_proofs[]` element's own `witnesses` takes — so a receipt
+/// producer copies it into the element a mirror serves and changes nothing. `checkpoint` is
+/// carried alongside so that the pairing is checkable without a second request: a cosignature
+/// is over one checkpoint, and an element whose `checkpoint` is a different one is not the
+/// element these cosignatures attest.
+#[derive(Debug, Serialize)]
+struct RotationCosignaturesResponse {
+    log_id: String,
+    manifest_entry_index: u64,
+    checkpoint: crate::checkpoint::Checkpoint,
+    witnesses: Vec<RotationWitnessEntry>,
+}
+
+/// One `anchoring.witnesses[]` element (I-D §7.1).
+#[derive(Debug, Serialize)]
+struct RotationWitnessEntry {
+    witness_id: String,
+    key_id: String,
+    cosignature: String,
+    cosigned_at: String,
+}
+
+async fn rotation_cosignatures_handler(
+    State(state): State<AppState>,
+    Path((log_id, manifest_entry_index)): Path<(String, u64)>,
+) -> Result<Response, ApiError> {
+    anchor_for(&state.anchors, &log_id)?;
+    let store = Arc::clone(&state.store);
+    let queried = log_id.clone();
+    let held =
+        blocking(move || store.list_rotation_cosignatures(&queried, manifest_entry_index)).await?;
+
+    // Several cosignatures for one rotation are legitimate — any checkpoint past the rotating
+    // index and signed by the outgoing key is rotation material — so the earliest is served,
+    // deterministically, and the ones over other checkpoints are not mixed into one element:
+    // `anchoring.witnesses[]` is an array of cosignatures over ONE checkpoint.
+    let Some(first) = held.first() else {
+        return Err(ApiError::from(WitnessError::UnknownRotationCosignature {
+            manifest_entry_index,
+        }));
+    };
+    let checkpoint = first.checkpoint.clone();
+    let witnesses = held
+        .iter()
+        .filter(|cosigned| cosigned.checkpoint == checkpoint)
+        .map(|cosigned| RotationWitnessEntry {
+            witness_id: cosigned.witness_id.clone(),
+            key_id: cosigned.key_id.clone(),
+            cosignature: cosigned.cosignature.clone(),
+            cosigned_at: cosigned.cosigned_at.clone(),
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(RotationCosignaturesResponse { log_id, manifest_entry_index, checkpoint, witnesses }),
+    )
+        .into_response())
 }
 
 async fn refusals_handler(
@@ -739,5 +824,483 @@ mod tests {
                 .expect("well-formed signature"),
             "the cosignature must verify over the six-member projection"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Rotation-anchoring cosignatures (I-D §7.1)
+    // -----------------------------------------------------------------------
+
+    /// A log that has performed a log-key rotation, driven through the real router, and the
+    /// receipt cross-check that decides whether what this witness serves is the thing I-D §7.1
+    /// defines.
+    ///
+    /// Three entries: the genesis manifest at index 0 under the OUTGOING log key, a successor
+    /// at index 1 that replaces the log key set with the INCOMING one, and a subject statement
+    /// at index 2. Every payload is a complete I-D §6.2/§2.2 statement rather than the minimum
+    /// this crate itself reads, because `a_receipt_carrying_the_served_cosignature_verifies`
+    /// hands the whole corpus to `ahl_core::receipt::verify_receipt_report`.
+    mod rotation {
+        use std::collections::BTreeMap;
+
+        use ahl_core::receipt::{
+            verify_receipt_report, AdaptorCapabilities, AdaptorProfile, Limits, Outcome,
+            TrustPolicy,
+        };
+        use serde_json::Value;
+
+        use super::*;
+
+        /// The artifact a verifier holds under `ahl-adaptor-atl-v1` in these tests. Its bytes
+        /// are what the manifests' `log.adaptor.hash` pins, recomputed rather than transcribed.
+        const PROFILE_DOCUMENT: &[u8] = b"ahl-adaptor-atl-v1 test artifact";
+
+        /// The entry index the rotating manifest is anchored at.
+        const ROTATING_INDEX: u64 = 1;
+
+        /// The witness seed the harness's signer uses.
+        const WITNESS_SEED: u8 = 0x0b;
+
+        fn manifest_payload(
+            log_id: &str,
+            producer: &ahl_core::TestKey,
+            log_key: &ahl_core::TestKey,
+            witness: &ahl_core::TestKey,
+            predecessor: Option<&str>,
+        ) -> Value {
+            let mut payload = json!({
+                "ahl_version": ahl_core::AHL_VERSION,
+                "type": "manifest",
+                "producer": "producer-1",
+                "issued_at": "2026-01-01T00:00:00Z",
+                "valid_time": "2026-01-01T00:00:00Z",
+                "keys": [ { "key_id": producer.key_id(), "pubkey": producer.pubkey() } ],
+                "log": {
+                    "log_id": log_id,
+                    "operator": "log-operator-1",
+                    "adaptor": {
+                        "id": ahl_core::ATL_PROFILE_ID,
+                        "hash": ahl_core::sha256_hex(PROFILE_DOCUMENT),
+                    },
+                    "checkpoint_cadence": "PT1H",
+                    "cadence_epoch": "2026-01-01T00:00:00Z",
+                    "witness_grace_period": "PT15M",
+                    "keys": [ {
+                        "key_id": log_key.key_id(),
+                        "pubkey": log_key.pubkey(),
+                        "valid_from_index": 0,
+                    } ],
+                },
+                "witnesses": [ {
+                    "witness_id": "witness-1",
+                    "keys": [ {
+                        "key_id": witness.key_id(),
+                        "pubkey": witness.pubkey(),
+                        "valid_from_index": 0,
+                    } ],
+                } ],
+                "datasets": {
+                    "records": {
+                        "canonicalization": "jcs",
+                        "commitment_mode": "plain",
+                        "key_access": "not-applicable",
+                        "authority": {
+                            "producer": "producer-1",
+                            "key_ids": [ producer.key_id() ],
+                        },
+                    },
+                },
+                "pipelines": { "include": [], "exclude": [] },
+                "windows": { "anchoring": "PT24H", "propagation": "P30D" },
+                "retention": { "statements": "P10Y" },
+                "properties": { "reproducible_reconstruction": false },
+                "level": "L3",
+            });
+            if let Some(predecessor) = predecessor {
+                payload["predecessor"] = json!(predecessor);
+            }
+            payload
+        }
+
+        struct Corpus {
+            state: AppState,
+            outgoing: ahl_core::TestKey,
+            incoming: ahl_core::TestKey,
+            producer: ahl_core::TestKey,
+            witness: ahl_core::TestKey,
+            log_id: String,
+            genesis_entry_id: String,
+            envelopes: Vec<Value>,
+            entries: Vec<Vec<u8>>,
+            leaves: Vec<Hash>,
+            root: Hash,
+        }
+
+        impl Corpus {
+            fn app(&self) -> Router {
+                router(self.state.clone())
+            }
+
+            fn checkpoint(&self, key: &ahl_core::TestKey, time: &str) -> Checkpoint {
+                let mut cp = Checkpoint {
+                    log_id: self.log_id.clone(),
+                    tree_size: 3,
+                    root_hash: format!("sha256:{}", hex::encode(self.root)),
+                    checkpoint_time: time.to_owned(),
+                    key_id: key.key_id(),
+                    signature: String::new(),
+                };
+                let blob = crate::checkpoint::checkpoint_blob(&cp).expect("well-formed");
+                cp.signature = key.sign(&blob);
+                cp
+            }
+        }
+
+        fn corpus() -> Corpus {
+            let producer =
+                ahl_core::TestKey::from_seed_hex("producer", &"c1".repeat(32)).expect("seed");
+            let outgoing =
+                ahl_core::TestKey::from_seed_hex("log-out", &"c2".repeat(32)).expect("seed");
+            let incoming =
+                ahl_core::TestKey::from_seed_hex("log-in", &"c3".repeat(32)).expect("seed");
+            let witness = ahl_core::TestKey::from_seed_hex(
+                "witness-1",
+                &format!("{WITNESS_SEED:02x}").repeat(32),
+            )
+            .expect("seed");
+            let log_id = format!("sha256:{}", "c4".repeat(32));
+
+            let genesis = ahl_core::envelope(
+                manifest_payload(&log_id, &producer, &outgoing, &witness, None),
+                &producer,
+            );
+            let genesis_entry_id = ahl_core::entry_id(&genesis);
+            let rotating = ahl_core::envelope(
+                manifest_payload(&log_id, &producer, &incoming, &witness, Some(&genesis_entry_id)),
+                &producer,
+            );
+            let rotating_statement_id =
+                ahl_core::statement_id(&rotating).expect("well-formed envelope");
+            let subject = ahl_core::envelope(
+                json!({
+                    "ahl_version": ahl_core::AHL_VERSION,
+                    "type": "ingestion",
+                    "producer": "producer-1",
+                    "issued_at": "2026-01-01T00:00:00Z",
+                    "valid_time": "2026-01-01T00:00:00Z",
+                    "manifest": rotating_statement_id,
+                    "dataset": "records",
+                    "origin": "batch:2026-01-01/records-01",
+                    "record": format!("sha256:{}", "d1".repeat(32)),
+                }),
+                &producer,
+            );
+
+            let envelopes = vec![genesis, rotating, subject];
+            let entries: Vec<Vec<u8>> = envelopes.iter().map(ahl_core::jcs).collect();
+            let leaves: Vec<Hash> = entries.iter().map(|b| log_leaf_hash(b)).collect();
+            let root = compute_root(&leaves);
+
+            let anchor = LogAnchor::resolve(&LogAnchorSpec {
+                log_id: log_id.clone(),
+                genesis_manifest_entry_id: genesis_entry_id.clone(),
+                genesis_producer_keys: vec![KeyObjectSpec {
+                    key_id: producer.key_id(),
+                    pubkey: producer.pubkey(),
+                    valid_from_index: 0,
+                }],
+            })
+            .expect("valid anchor");
+            let mut anchors = HashMap::new();
+            anchors.insert(log_id.clone(), anchor);
+            let signer = Ed25519WitnessSigner::from_seed("witness-1", &[WITNESS_SEED; 32])
+                .expect("32 bytes");
+            assert_eq!(signer.key_id(), witness.key_id(), "the manifests declare this key");
+
+            Corpus {
+                state: AppState {
+                    store: Arc::new(Store::open_in_memory().expect("in-memory store")),
+                    signer: Arc::new(signer),
+                    anchors: Arc::new(anchors),
+                },
+                outgoing,
+                incoming,
+                producer,
+                witness,
+                log_id,
+                genesis_entry_id,
+                envelopes,
+                entries,
+                leaves,
+                root,
+            }
+        }
+
+        async fn submit(corpus: &Corpus, app: &Router, cp: &Checkpoint) -> (StatusCode, Value) {
+            let request = Request::post(format!("/v1/logs/{}/witness", corpus.log_id))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&witness_body(cp, &corpus.entries)).expect("serialize"),
+                ))
+                .expect("valid request");
+            let response = app.clone().oneshot(request).await.expect("service call");
+            let status = response.status();
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
+        async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+            let request = Request::get(uri).body(Body::empty()).expect("valid request");
+            let response = app.clone().oneshot(request).await.expect("service call");
+            let status = response.status();
+            let body = response.into_body().collect().await.expect("body").to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
+        /// A genuine RFC 6962 inclusion path (leaf to root) for `leaves[index]`.
+        fn path_for(corpus: &Corpus, index: u64) -> Vec<String> {
+            let tree_size = u64::try_from(corpus.leaves.len()).expect("small test size");
+            let proof =
+                atl_core::core::merkle::generate_inclusion_proof(index, tree_size, |level, at| {
+                    if level == 0 {
+                        corpus.leaves.get(usize::try_from(at).ok()?).copied()
+                    } else {
+                        None
+                    }
+                })
+                .expect("index within tree");
+            ahl_core::proof_path_hex(&proof)
+        }
+
+        /// Assemble a `statement-anchored` receipt over `corpus`, carrying `element` as its
+        /// one `governance.rotation_proofs[]` element and `anchoring_witnesses` as the
+        /// cosignatures over `anchoring_cp`.
+        fn receipt_over(
+            corpus: &Corpus,
+            anchoring_cp: &Checkpoint,
+            anchoring_witnesses: &Value,
+            element: &Value,
+        ) -> Value {
+            let key_object = |key_id: String, pubkey: String, entry_index: u64| {
+                json!({
+                    "key_id": key_id,
+                    "pubkey": pubkey,
+                    "source": "manifest-chain",
+                    "binding": { "entry_index": entry_index },
+                })
+            };
+            let witness_key_object = |entry_index: u64| {
+                json!({
+                    "witness_id": "witness-1",
+                    "key_id": corpus.witness.key_id(),
+                    "pubkey": corpus.witness.pubkey(),
+                    "source": "manifest-chain",
+                    "binding": { "entry_index": entry_index },
+                })
+            };
+            json!({
+                "ahl_receipt_version": "2",
+                "spec_version": "0.4.0",
+                "claim": {
+                    "type": "statement-anchored",
+                    "assurance": {
+                        "governance": "declared",
+                        "competing_triggers": "not-checked",
+                        "witnessed": true,
+                        "continued_history": false,
+                        "content_binding": "none",
+                    },
+                },
+                "subject": {
+                    "statement_id": ahl_core::statement_id(&corpus.envelopes[2]).expect("id"),
+                    "entry_id": ahl_core::entry_id(&corpus.envelopes[2]),
+                    "entry_index": 2,
+                    "manifest": ahl_core::statement_id(&corpus.envelopes[1]).expect("id"),
+                },
+                "envelope": corpus.envelopes[2],
+                "keys": {
+                    // The same physical key is listed once per manifest version it is drawn
+                    // from: the version active for the anchoring checkpoint, and — for the
+                    // rotation material alone — the predecessor version §7.1's transition
+                    // exception names.
+                    "log": [
+                        key_object(
+                            corpus.incoming.key_id(), corpus.incoming.pubkey(), ROTATING_INDEX
+                        ),
+                        key_object(corpus.outgoing.key_id(), corpus.outgoing.pubkey(), 0),
+                    ],
+                    "witness": [ witness_key_object(ROTATING_INDEX), witness_key_object(0) ],
+                    "producer": [ key_object(
+                        corpus.producer.key_id(), corpus.producer.pubkey(), ROTATING_INDEX
+                    ) ],
+                },
+                "anchoring": {
+                    "adaptor": {
+                        "id": ahl_core::ATL_PROFILE_ID,
+                        "hash": ahl_core::sha256_hex(PROFILE_DOCUMENT),
+                    },
+                    "checkpoint": anchoring_cp,
+                    "inclusion_path": path_for(corpus, 2),
+                    "witnesses": anchoring_witnesses,
+                },
+                "governance": {
+                    "genesis_entry_id": corpus.genesis_entry_id,
+                    "chain": [
+                        {
+                            "envelope": corpus.envelopes[0],
+                            "entry_index": 0,
+                            "inclusion_path": path_for(corpus, 0),
+                        },
+                        {
+                            "envelope": corpus.envelopes[1],
+                            "entry_index": ROTATING_INDEX,
+                            "inclusion_path": path_for(corpus, ROTATING_INDEX),
+                        },
+                    ],
+                    "rotation_proofs": [ element ],
+                    "currency": { "mode": "declared" },
+                },
+            })
+        }
+
+        #[tokio::test]
+        async fn the_rotation_cosignature_is_served_apart_from_the_series() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let rotation_cp = corpus.checkpoint(&corpus.outgoing, "2026-01-01T01:00:00.000000000Z");
+
+            let (status, body) = submit(&corpus, &app, &rotation_cp).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["status"], "cosigned-rotation");
+            assert_eq!(body["manifest_entry_index"], ROTATING_INDEX);
+
+            // Served on its own route, in the `anchoring.witnesses[]` element shape.
+            let (status, served) = get_json(
+                &app,
+                &format!("/v1/logs/{}/rotation-cosignatures/{ROTATING_INDEX}", corpus.log_id),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{served}");
+            assert_eq!(served["manifest_entry_index"], ROTATING_INDEX);
+            assert_eq!(served["checkpoint"], serde_json::to_value(&rotation_cp).expect("json"));
+            let witnesses = served["witnesses"].as_array().expect("an array");
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(witnesses[0]["witness_id"], "witness-1");
+            assert_eq!(witnesses[0]["key_id"], corpus.witness.key_id());
+
+            // And nowhere else: not the latest cosigned checkpoint, not in the history, not a
+            // freshness answer.
+            assert_eq!(
+                get_json(&app, &format!("/v1/logs/{}/checkpoint", corpus.log_id)).await.0,
+                StatusCode::NOT_FOUND
+            );
+            let (status, history) =
+                get_json(&app, &format!("/v1/logs/{}/checkpoints", corpus.log_id)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(history, json!([]));
+            assert_eq!(
+                get_json(&app, &format!("/v1/logs/{}/freshness", corpus.log_id)).await.0,
+                StatusCode::NOT_FOUND
+            );
+
+            // A rotation this log did not perform has no cosignature to serve.
+            assert_eq!(
+                get_json(&app, &format!("/v1/logs/{}/rotation-cosignatures/0", corpus.log_id))
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        #[tokio::test]
+        async fn an_incoming_key_checkpoint_is_an_ordinary_cosign() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let series_cp = corpus.checkpoint(&corpus.incoming, "2026-01-01T01:00:00.000000000Z");
+
+            let (status, body) = submit(&corpus, &app, &series_cp).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["status"], "cosigned");
+            assert_eq!(
+                get_json(&app, &format!("/v1/logs/{}/checkpoint", corpus.log_id)).await.0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                get_json(
+                    &app,
+                    &format!("/v1/logs/{}/rotation-cosignatures/{ROTATING_INDEX}", corpus.log_id)
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        /// The cross-check that decides whether the cosignature this witness serves is the
+        /// thing I-D §7.1 asks for at L3: a receipt whose `governance.rotation_proofs[0]`
+        /// carries it, verified by `ahl-core`'s own verifier, which requires at least one
+        /// element of that member to verify "under a witness key of the OUTGOING state".
+        ///
+        /// Nothing served is edited on the way in. If this witness had cosigned the wrong
+        /// projection, cosigned under an identity the outgoing manifest does not declare, or
+        /// served a cosignature over a different checkpoint from the one the element carries,
+        /// §7.5.1 4b(M)'s rotation-anchoring rule would reject the receipt.
+        #[tokio::test]
+        async fn a_receipt_carrying_the_served_cosignature_verifies() {
+            let corpus = corpus();
+            let app = corpus.app();
+            let rotation_cp = corpus.checkpoint(&corpus.outgoing, "2026-01-01T01:00:00.000000000Z");
+            let anchoring_cp =
+                corpus.checkpoint(&corpus.incoming, "2026-01-01T02:00:00.000000000Z");
+
+            let (status, rotation_body) = submit(&corpus, &app, &rotation_cp).await;
+            assert_eq!(status, StatusCode::CREATED, "{rotation_body}");
+            let (status, series_body) = submit(&corpus, &app, &anchoring_cp).await;
+            assert_eq!(status, StatusCode::CREATED, "{series_body}");
+            assert_eq!(series_body["status"], "cosigned");
+
+            let (status, served) = get_json(
+                &app,
+                &format!("/v1/logs/{}/rotation-cosignatures/{ROTATING_INDEX}", corpus.log_id),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{served}");
+
+            let receipt = receipt_over(
+                &corpus,
+                &anchoring_cp,
+                &json!([{
+                    "witness_id": series_body["witness_id"],
+                    "key_id": series_body["key_id"],
+                    "cosignature": series_body["cosignature"],
+                    "cosigned_at": series_body["cosigned_at"],
+                }]),
+                &json!({
+                    "manifest_entry_index": ROTATING_INDEX,
+                    "checkpoint": served["checkpoint"],
+                    "inclusion_path": path_for(&corpus, ROTATING_INDEX),
+                    "witnesses": served["witnesses"],
+                }),
+            );
+
+            let policy = TrustPolicy {
+                genesis_entry_id: corpus.genesis_entry_id.clone(),
+                genesis_key_ids: None,
+                adaptor_profiles: BTreeMap::from([(
+                    ahl_core::ATL_PROFILE_ID.to_owned(),
+                    AdaptorProfile {
+                        document: PROFILE_DOCUMENT.to_vec(),
+                        capabilities: AdaptorCapabilities {
+                            checkpoint_raw: false,
+                            consistency_proofs: false,
+                        },
+                    },
+                )]),
+                dataset_keys: BTreeMap::new(),
+                trusted_witness_keys: BTreeMap::new(),
+                limits: Limits::default(),
+            };
+
+            let report = verify_receipt_report(&receipt, &policy).expect("the run completes");
+            assert_eq!(report.result, Outcome::Verified, "findings: {:?}", report.findings);
+        }
     }
 }

@@ -1,0 +1,73 @@
+[package]
+name = "ahl-witness-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+base64 = "0.22"
+ed25519-dalek = "2"
+hex = "0.4"
+ahl-core = { path = "../../ahl-core" }
+# The same pinned revision the library uses, so cargo unifies them and the fixture roots this
+# crate computes are the roots the library computes.
+atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+
+[dependencies.ahl-witness]
+path = ".."
+
+[lints.clippy]
+# Every target is panic-free by construction: nothing here unwraps, indexes or asserts. The
+# no-panic policy the parent crate states applies to this crate too, because a panic raised by
+# the harness itself would be reported as a finding against the library under test.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+
+# Not a member of any workspace: the parent directory is `ahl-witness` itself, and a fuzz crate
+# that joined it would put `libfuzzer-sys` and its nightly-only instrumentation into the
+# library's own dependency graph.
+[workspace]
+
+[[bin]]
+name = "witness_request"
+path = "fuzz_targets/witness_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint"
+path = "fuzz_targets/checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "governance"
+path = "fuzz_targets/governance.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "refusal"
+path = "fuzz_targets/refusal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

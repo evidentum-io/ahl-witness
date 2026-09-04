@@ -1,0 +1,14 @@
+{
+  "checkpoint": {
+    "checkpoint_time": "2026-01-01T00:00:00.000000000Z",
+    "key_id": "sha256:448f04ffcba874db93d9fd02520daa583a92b1f20b100ff791202a6d7a93e0de",
+    "log_id": "sha256:11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa",
+    "root_hash": "sha256:a626fe51538770b858608671266e100445e75b07502c6a770c8507f9d5ed0b53",
+    "signature": "base64:wrRHv19++bouL+u50CczOKQWy6Rf8V6FsUB5PwIXdy+otMp3RFB2xUcl88RQ1xCjcqtfE0KjJOUG6aP4j9jWDQ==",
+    "tree_size": 1
+  },
+  "cosignature": "base64:0Z+pc4/jdkf6KBVdGKsm6UFK7txHKYBlob2RBZF36N57w0wU2BE4qGdbvFGrvpWkqee5JrRQNJHCnuIzDePUBA==",
+  "cosigned_at": "2026-06-01T00:00:00Z",
+  "key_id": "sha256:dbc298251c51321b7266e78d1c151c2b62aff8cb95b293096d3463018544face",
+  "witness_id": "witness-1"
+}

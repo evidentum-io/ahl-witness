@@ -274,7 +274,7 @@ authentication and retry policy is a deployment concern.
 | route | method | purpose |
 | --- | --- | --- |
 | `/health` | GET | liveness |
-| `/v1/witness-key` | GET | this witness's id, key id and public key |
+| `/v1/witness-key` | GET | this witness's id and key id — never the public key: a witness key is trusted only through the manifest's witness key object or the verifier's own policy (I-D §7.1), not through the witness's own answer |
 | `/v1/logs/{log_id}/witness` | POST | submit a checkpoint (+ entries) to be witnessed |
 | `/v1/logs/{log_id}/checkpoint` | GET | the latest cosigned checkpoint for this log |
 | `/v1/logs/{log_id}/checkpoints` | GET | the complete cosigned history for this log |

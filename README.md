@@ -4,6 +4,33 @@ An independent witness for the [AHL Protocol](https://atl-protocol.org)'s `ahl-a
 profile: the core spec §3.3 cosigning state machine, refusal evidence on equivocation, and
 freshness reporting — the piece that makes conformance level L3 reachable on an ATL-backed log.
 
+## No panic
+
+`ahl-witness` reaches no panicking construct on any input to its parsers — the body of `POST
+/v1/logs/{log_id}/witness` (the only request body the crate accepts, and the entry point of
+`witness::witness_checkpoint`), the signed checkpoint object (`checkpoint::parse_checkpoint_time`,
+`checkpoint::checkpoint_blob`, `checkpoint::verify_checkpoint_signature`), the anchored entries
+the governance walk reads (`governance::resolve`, and the §7.3 duration grammar it applies), the
+published evidence a verifier reads back (`witness::verify_refusal_claim`,
+`witness::verify_refusal_signature`, `witness::verify_cosignature`), and the deployment
+configuration the binary loads (`config::Deployment::resolve`). Malformed, hostile or simply
+absurd input is reported as an error, a refusal, or a `false` verdict, never as an abort of the
+process. The mechanism is the package-level lints in `Cargo.toml` (`clippy::unwrap_used`,
+`expect_used`, `indexing_slicing`, `arithmetic_side_effects`, `panic`, `unreachable`, `todo`,
+`unimplemented`, `missing_panics_doc`, all denied and satisfied in library and binary code
+rather than allowed at a site); the evidence is the five libFuzzer targets in
+[fuzz/](fuzz/README.md). The boundary: I/O, `SQLite` and network failures are results, not
+panics — every store call returns a `WitnessError` and every handler maps it to a status code;
+allocation failure and stack exhaustion are out of scope, since neither is a panic and neither
+is something a server can decline; nesting depth is bounded by `serde_json`, which refuses a
+document nested deeper than 128 levels with an error rather than recursing, so a request body is
+already bounded by the time this crate sees it, while a `Value` built programmatically to
+arbitrary depth is not and is outside the claim; request body size is the deployment's to bound,
+through whatever fronts the listener, since this crate sets no limit of its own; and `ahl-core`
+and `atl-core` — the siblings that perform canonicalization, envelope verification, node hashing
+and proof verification — are not covered, because the claim is about this crate's own code, and
+`ahl-core` states the same claim for itself.
+
 ## Why this exists
 
 Inclusion and consistency proofs establish consistency only within the view a verifier is
@@ -326,7 +353,9 @@ reasoning is what a future spec reader needs to know a question was ever open.
 Same harness as `ahl-mirror`: `clippy.toml`, `rustfmt.toml`, the `[lints]` block, GitHub Actions
 CI (`fmt`, `clippy -D warnings`, `test`, `doc -D warnings`, `cargo llvm-cov --fail-under-lines
 90`, MSRV 1.92.0 check) and weekly `cargo audit`. No `unwrap`/`expect`/`panic!` outside
-`#[cfg(test)]`. Deterministic tests only — no real clocks, no real network.
+`#[cfg(test)]`, and none of the other six panicking constructs either — see "No panic" above
+for the full list, the fuzz evidence and the boundary. Deterministic tests only — no real
+clocks, no real network.
 
 ## License
 

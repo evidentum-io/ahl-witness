@@ -95,7 +95,9 @@ jobs:
             ahl-witness
             ahl-witness/fuzz
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       # Build only: a run needs a time budget a pull request cannot carry, and its result
       # depends on the seed corpus and the machine. This step exists to keep the targets
       # compiling against the library they exercise, so a signature change cannot silently

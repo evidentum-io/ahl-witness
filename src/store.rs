@@ -2,6 +2,19 @@
 //! cosigned-checkpoint history, and published refusal evidence (core spec §3.3; adaptor
 //! profile §11).
 //!
+//! # Rotation cosignatures are stored apart
+//!
+//! `rotation_cosignatures` is a second, separate table, and separateness is the point. A
+//! rotation-anchoring checkpoint verifies under the OUTGOING governance state rather than the
+//! state active for its own `tree_size` (I-D §7.1's transition exception), so it is not a
+//! member of the series this witness tracks: it never becomes the retained checkpoint, never
+//! enters the cosigned history a later candidate is checked for consistency against, and never
+//! grounds a freshness answer. Holding it in `cosigned_checkpoints` and filtering on read would
+//! make every one of those call sites responsible for remembering the distinction; holding it
+//! apart means none of them can forget. What the two DO share is equivocation detection: a
+//! rotation-anchoring checkpoint offered at a `tree_size` this witness has already cosigned
+//! with a different root is equivocation like any other, and is refused with evidence.
+//!
 //! Unlike `ahl-mirror`'s store, this one holds no entry bytes and no candidate material —
 //! a witness's job is narrower (verify and cosign or refuse, core spec §3.3), not to serve
 //! entries or range proofs (that is `ahl-mirror`'s and any independent mirror's job, core
@@ -21,14 +34,15 @@
 //! atomic, but it is **not** enough to make a multi-step decision (read the retained state,
 //! classify a candidate against it, then write the result) atomic as a whole: two threads can
 //! each acquire and release the lock once per step, interleaving between them. The fix is
-//! `Store::with_lock` (crate-private): it exposes the same mutex for the *entire* decision, so
-//! [`crate::witness::witness_checkpoint`] performs every read and the resulting write inside
-//! one critical section, re-reading state itself rather than trusting a value read before the
-//! lock was (re)acquired. The two writes an equivocation discovery requires — the
-//! `equivocations` floor row and its accompanying refusal evidence — are additionally wrapped
-//! in a real `SQLite` transaction (the crate-private `insert_equivocation_and_refusal`) so
-//! they persist together or not at all, independent of the in-process lock (which protects
-//! against concurrent *readers/writers*, not against a crash mid-write).
+//! `Store::with_transaction` (crate-private): it exposes the same mutex for the *entire*
+//! decision, so [`crate::witness::witness_checkpoint`] performs every read and every write it
+//! produces inside one critical section, re-reading state itself rather than trusting a value
+//! read before the lock was (re)acquired — and it wraps those writes in one `SQLite`
+//! transaction, so they persist together or not at all, independent of the in-process lock
+//! (which protects against concurrent *readers/writers*, not against a crash mid-write). One
+//! admission legitimately makes several writes: the retained cosignature, a rotation record per
+//! rotation the checkpoint anchors (I-D §7.1), or an equivocation floor together with the
+//! refusal evidence that justifies it. None of those may land without the others.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -56,6 +70,20 @@ CREATE TABLE IF NOT EXISTS cosigned_checkpoints (
     cadence_nanos   INTEGER NOT NULL,
     grace_nanos     INTEGER NOT NULL,
     UNIQUE(log_id, tree_size, checkpoint_time)
+);
+CREATE TABLE IF NOT EXISTS rotation_cosignatures (
+    log_id               TEXT NOT NULL,
+    manifest_entry_index INTEGER NOT NULL,
+    tree_size            INTEGER NOT NULL,
+    root_hash            TEXT NOT NULL,
+    checkpoint_time      TEXT NOT NULL,
+    log_key_id           TEXT NOT NULL,
+    log_signature        TEXT NOT NULL,
+    witness_id           TEXT NOT NULL,
+    witness_key_id       TEXT NOT NULL,
+    cosignature          TEXT NOT NULL,
+    cosigned_at          TEXT NOT NULL,
+    PRIMARY KEY (log_id, manifest_entry_index, tree_size, checkpoint_time)
 );
 CREATE TABLE IF NOT EXISTS refusals (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,22 +189,53 @@ impl Store {
         result
     }
 
-    /// Hold this store's lock for an entire multi-step decision, so every read inside `f`
-    /// observes state no concurrent caller can change until `f` returns, and the write(s) `f`
-    /// performs are indivisible from the caller's perspective (core spec §3.3, "serialize and
-    /// make atomic"). See the module docs for why per-call locking (what every other method
-    /// here does) is not sufficient on its own for a read-classify-write sequence, and see
-    /// [`crate::witness::witness_checkpoint`] for the one caller that needs this.
+    /// Hold this store's lock for an entire multi-step decision AND run every write it makes
+    /// inside one `SQLite` transaction: commit if `f` returns `Ok`, roll back if it returns
+    /// `Err` (core spec §3.3, "serialize and make atomic").
+    ///
+    /// Both halves are load-bearing and neither substitutes for the other. The lock is what
+    /// makes the READS consistent — see the module docs for why per-call locking is not
+    /// sufficient for a read-classify-write sequence. The transaction is what makes the WRITES
+    /// one write: an admission can put a cosignature in `cosigned_checkpoints` and in
+    /// `rotation_cosignatures` at once (I-D §7.1; see [`crate::witness::WitnessOutcome`]), and a
+    /// failure on the second of those must not leave the first standing. A refusal is an `Ok`
+    /// outcome and commits, which is the point — refusal evidence is a verdict this witness owes
+    /// the world, not a failure to write.
+    ///
+    /// `f` MUST use the `&Connection`-based helpers in this module rather than calling back into
+    /// any `&Store` method: the lock is already held here and `std::sync::Mutex` is not
+    /// reentrant, and a nested `BEGIN` is an error in `SQLite`.
     ///
     /// # Errors
     ///
-    /// Returns [`WitnessError::StoreInit`] if the lock is poisoned, or propagates whatever
-    /// `f` returns.
-    pub(crate) fn with_lock<T>(
+    /// [`WitnessError::StoreInit`] if the lock is poisoned, [`WitnessError::Store`] if starting
+    /// or committing the transaction fails, or whatever `f` itself returns (in which case the
+    /// transaction is rolled back before the error propagates).
+    // `significant_drop_tightening` wants the guard dropped as soon as possible, but `tx`
+    // borrows it mutably for its whole lifetime, so it cannot be released before the commit or
+    // rollback — holding it for the whole transaction is exactly the point of this method.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn with_transaction<T>(
         &self,
         f: impl FnOnce(&Connection) -> WitnessResult<T>,
     ) -> WitnessResult<T> {
-        self.with_conn(f)
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| WitnessError::StoreInit("store mutex poisoned".to_owned()))?;
+        let tx = conn.transaction().map_err(WitnessError::from)?;
+        match f(&tx) {
+            Ok(value) => {
+                tx.commit().map_err(WitnessError::from)?;
+                Ok(value)
+            }
+            Err(err) => {
+                // A rollback failure does not leave the writes committed: an uncommitted
+                // `Transaction` also rolls back on drop, so `err` is the right thing to report.
+                let _ = tx.rollback();
+                Err(err)
+            }
+        }
     }
 
     /// Retain a newly cosigned checkpoint, together with the cadence and grace period that
@@ -250,6 +309,20 @@ impl Store {
         self.with_conn(|conn| insert_refusal(conn, evidence))
     }
 
+    /// Every rotation cosignature this witness holds for the rotation anchored at
+    /// `manifest_entry_index`, oldest checkpoint first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WitnessError::Store`] on a database failure.
+    pub fn list_rotation_cosignatures(
+        &self,
+        log_id: &str,
+        manifest_entry_index: u64,
+    ) -> WitnessResult<Vec<CosignedCheckpoint>> {
+        self.with_conn(|conn| list_rotation_cosigned(conn, log_id, manifest_entry_index))
+    }
+
     /// Every refusal published for `log_id`, in the order recorded.
     ///
     /// # Errors
@@ -303,7 +376,7 @@ impl Store {
 // Free functions, not methods: each is called both from a `Store` method above (which wraps
 // exactly one of them in its own `with_conn` lock acquisition) and directly from
 // `crate::witness::witness_checkpoint`, composed together inside a *single*
-// `Store::with_lock` critical section. Keeping the SQL here and the decision logic in
+// `Store::with_transaction` critical section. Keeping the SQL here and the decision logic in
 // `witness.rs` keeps the atomicity fix mechanical: nothing here decides what to do, it only
 // reads and writes what it is told to.
 // ---------------------------------------------------------------------------
@@ -359,6 +432,130 @@ pub(crate) fn insert_cosigned(
     Ok(InsertOutcome::Inserted)
 }
 
+/// Record a cosignature over ROTATION-ANCHORING material, apart from the series (see the
+/// module docs). Idempotent for an identical resubmission.
+pub(crate) fn insert_rotation_cosigned(
+    conn: &Connection,
+    manifest_entry_index: u64,
+    cosigned: &CosignedCheckpoint,
+) -> WitnessResult<InsertOutcome> {
+    let cp = &cosigned.checkpoint;
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let tree_size_i64 = to_i64("tree_size", cp.tree_size)?;
+
+    // The primary key is `(log_id, manifest_entry_index, tree_size, checkpoint_time)`, and two
+    // DIFFERENT checkpoints can share it: a log may sign one tree state at one instant under two
+    // valid keys, and the key id and signature are not part of the key. So the row at that key is
+    // read and compared in full before anything is written — an identical one is idempotent, a
+    // different one is a conflict, and neither is an overwrite. `INSERT OR REPLACE` here would
+    // discard a cosignature this witness had already published over the other checkpoint.
+    let existing = conn
+        .query_row(
+            "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+             witness_id, witness_key_id, cosignature, cosigned_at \
+             FROM rotation_cosignatures WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+             AND tree_size = ?3 AND checkpoint_time = ?4",
+            params![cp.log_id, index_i64, tree_size_i64, cp.checkpoint_time],
+            cosigned_row,
+        )
+        .optional()?
+        .transpose()?;
+    if let Some(existing) = existing {
+        if &existing == cosigned {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+        return Err(WitnessError::RotationCosignatureConflict {
+            manifest_entry_index,
+            tree_size: cp.tree_size,
+            checkpoint_time: cp.checkpoint_time.clone(),
+        });
+    }
+
+    // Keep only anchors that could be served. After a rotation that left the LOG key set alone —
+    // I-D §7.1 makes a change to the witness key objects a rotation on its own — every later
+    // checkpoint of the series qualifies as that rotation's anchor, so recording each one would
+    // grow this table with the series to no purpose: the rotation route serves the smallest
+    // `(tree_size, checkpoint_time)` and nothing else. A candidate no earlier than one already
+    // held is therefore superseded rather than stored. What IS stored stays: an earlier candidate
+    // arriving later is recorded beside the one it supersedes, never over it, so what is served
+    // is the minimum over everything ever cosigned and does not depend on arrival order.
+    let held: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT tree_size, checkpoint_time FROM rotation_cosignatures \
+             WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+             ORDER BY tree_size ASC, checkpoint_time ASC LIMIT 1",
+            params![cp.log_id, index_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((held_size, held_time)) = held {
+        if (held_size, held_time.as_str()) <= (tree_size_i64, cp.checkpoint_time.as_str()) {
+            return Ok(InsertOutcome::AlreadyPresent);
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO rotation_cosignatures \
+         (log_id, manifest_entry_index, tree_size, root_hash, checkpoint_time, log_key_id, \
+          log_signature, witness_id, witness_key_id, cosignature, cosigned_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            cp.log_id,
+            index_i64,
+            tree_size_i64,
+            cp.root_hash,
+            cp.checkpoint_time,
+            cp.key_id,
+            cp.signature,
+            cosigned.witness_id,
+            cosigned.key_id,
+            cosigned.cosignature,
+            cosigned.cosigned_at,
+        ],
+    )?;
+    Ok(InsertOutcome::Inserted)
+}
+
+/// Every rotation cosignature this witness holds for one rotation, oldest checkpoint first.
+pub(crate) fn list_rotation_cosigned(
+    conn: &Connection,
+    log_id: &str,
+    manifest_entry_index: u64,
+) -> WitnessResult<Vec<CosignedCheckpoint>> {
+    let index_i64 = to_i64("manifest_entry_index", manifest_entry_index)?;
+    let mut stmt = conn.prepare(
+        "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+         witness_id, witness_key_id, cosignature, cosigned_at \
+         FROM rotation_cosignatures WHERE log_id = ?1 AND manifest_entry_index = ?2 \
+         ORDER BY tree_size ASC, checkpoint_time ASC",
+    )?;
+    let rows = stmt.query_map(params![log_id, index_i64], cosigned_row)?;
+    rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
+}
+
+/// Read a [`CosignedCheckpoint`] from the ten columns the rotation table selects.
+fn cosigned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WitnessResult<CosignedCheckpoint>> {
+    let tree_size: i64 = row.get(1)?;
+    let checkpoint = Checkpoint {
+        log_id: row.get(0)?,
+        tree_size: match u64::try_from(tree_size) {
+            Ok(value) => value,
+            Err(_) => return Ok(Err(WitnessError::IndexOverflow { what: "tree_size" })),
+        },
+        root_hash: row.get(2)?,
+        checkpoint_time: row.get(3)?,
+        key_id: row.get(4)?,
+        signature: row.get(5)?,
+    };
+    Ok(Ok(CosignedCheckpoint {
+        checkpoint,
+        witness_id: row.get(6)?,
+        key_id: row.get(7)?,
+        cosignature: row.get(8)?,
+        cosigned_at: row.get(9)?,
+    }))
+}
+
 pub(crate) fn get_retained(
     conn: &Connection,
     log_id: &str,
@@ -393,6 +590,33 @@ pub(crate) fn find_cosigned_at_size(
     )
     .optional()?
     .transpose()
+}
+
+/// A checkpoint this witness has already cosigned at `tree_size` whose root DIFFERS from
+/// `root_hash`, drawn from the rotation table.
+///
+/// The series table has its own lookup ([`find_cosigned_at_size`]); this is the other half, so
+/// that "compare against the whole retained history" (core spec §3.3) means the whole of it and
+/// not the series alone. Material held apart from the series is still material this witness
+/// vouched for at that size.
+pub(crate) fn find_rotation_conflict(
+    conn: &Connection,
+    log_id: &str,
+    tree_size: u64,
+    root_hash: &str,
+) -> WitnessResult<Option<Checkpoint>> {
+    let tree_size_i64 = to_i64("tree_size", tree_size)?;
+    let found = conn
+        .query_row(
+            "SELECT log_id, tree_size, root_hash, checkpoint_time, log_key_id, log_signature, \
+             witness_id, witness_key_id, cosignature, cosigned_at \
+             FROM rotation_cosignatures WHERE log_id = ?1 AND tree_size = ?2 AND root_hash <> ?3 \
+             ORDER BY checkpoint_time ASC LIMIT 1",
+            params![log_id, tree_size_i64, root_hash],
+            cosigned_row,
+        )
+        .optional()?;
+    found.transpose().map(|found| found.map(|cosigned| cosigned.checkpoint))
 }
 
 pub(crate) fn insert_refusal(conn: &Connection, evidence: &RefusalEvidence) -> WitnessResult<()> {
@@ -457,6 +681,12 @@ pub(crate) fn original_equivocation_pair(
 /// # Errors
 ///
 /// Returns [`WitnessError::Store`] on a database failure.
+/// Record an equivocation floor and the refusal evidence that justifies it.
+///
+/// Core spec §3.3 requires the two to persist together. They do so through the CALLER's
+/// transaction ([`Store::with_transaction`]) rather than one of this function's own: an
+/// admission may already have written a cosignature by the time equivocation is found on a
+/// later step, and a nested `BEGIN` is an error in `SQLite`.
 pub(crate) fn insert_equivocation_and_refusal(
     conn: &Connection,
     log_id: &str,
@@ -465,8 +695,7 @@ pub(crate) fn insert_equivocation_and_refusal(
     evidence: &RefusalEvidence,
 ) -> WitnessResult<InsertOutcome> {
     let tree_size_i64 = to_i64("tree_size", tree_size)?;
-    let tx = conn.unchecked_transaction()?;
-    let existing: Option<i64> = tx
+    let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM equivocations WHERE log_id = ?1 AND tree_size = ?2",
             params![log_id, tree_size_i64],
@@ -476,14 +705,13 @@ pub(crate) fn insert_equivocation_and_refusal(
     let outcome = if existing.is_some() {
         InsertOutcome::AlreadyPresent
     } else {
-        tx.execute(
+        conn.execute(
             "INSERT INTO equivocations (log_id, tree_size, detected_at) VALUES (?1, ?2, ?3)",
             params![log_id, tree_size_i64, detected_at],
         )?;
         InsertOutcome::Inserted
     };
-    insert_refusal(&tx, evidence)?;
-    tx.commit()?;
+    insert_refusal(conn, evidence)?;
     Ok(outcome)
 }
 
@@ -774,7 +1002,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -797,7 +1025,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -808,7 +1036,7 @@ mod tests {
             })
             .expect("record");
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -827,7 +1055,7 @@ mod tests {
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         assert_eq!(
             store
-                .with_lock(|conn| insert_equivocation_and_refusal(
+                .with_transaction(|conn| insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
                     5,
@@ -839,7 +1067,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .with_lock(|conn| insert_equivocation_and_refusal(
+                .with_transaction(|conn| insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
                     5,
@@ -859,7 +1087,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store");
         let evidence = refusal("sha256:aa", RefusalReason::Equivocation);
         store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 insert_equivocation_and_refusal(
                     conn,
                     "sha256:aa",
@@ -879,7 +1107,7 @@ mod tests {
         // directly rather than the per-call `Store` methods.
         let store = Store::open_in_memory().expect("in-memory store");
         let outcome = store
-            .with_lock(|conn| {
+            .with_transaction(|conn| {
                 let _retained = get_retained(conn, "sha256:aa")?;
                 let _at_size = find_cosigned_at_size(conn, "sha256:aa", 1)?;
                 let _floor = equivocation_floor(conn, "sha256:aa")?;

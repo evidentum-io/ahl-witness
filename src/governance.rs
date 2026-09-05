@@ -37,7 +37,7 @@
 //! library the two components both depend on, to remove the duplication this module
 //! currently accepts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use ed25519_dalek::VerifyingKey;
 use serde::Deserialize;
@@ -55,6 +55,13 @@ struct AdaptorBlock {
     id: String,
     #[allow(dead_code)]
     hash: String,
+}
+
+/// One entry of the manifest's top-level `witnesses` array (core spec §6.2).
+#[derive(Debug, Deserialize)]
+struct WitnessBlock {
+    witness_id: String,
+    keys: Vec<KeyObjectSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +83,7 @@ struct LogBlock {
 pub struct GovernanceState {
     producer_keys: HashMap<String, ResolvedKeyObject>,
     log_keys: Vec<ResolvedKeyObject>,
+    witness_keys: Vec<(String, ResolvedKeyObject)>,
     cadence_nanos: u64,
     cadence_epoch_nanos: u64,
     witness_grace_period_nanos: u64,
@@ -105,6 +113,61 @@ impl GovernanceState {
             });
         }
         Ok(&key.verifying_key)
+    }
+
+    /// This version's LOG checkpoint-signing key objects as a SET of
+    /// `(key_id, pubkey, valid_from_index)`.
+    ///
+    /// A set, not a sequence: core spec §6.2 says "each manifest version's log and witness key
+    /// objects replace the prior set in full", so re-listing the same objects in a different
+    /// order declares the same state and is not a rotation.
+    fn log_key_set(&self) -> BTreeSet<(String, String, u64)> {
+        self.log_keys
+            .iter()
+            .map(|k| (k.key_id.clone(), k.pubkey.clone(), k.valid_from_index))
+            .collect()
+    }
+
+    /// This version's WITNESS key objects as a SET of
+    /// `(witness_id, key_id, pubkey, valid_from_index)`.
+    ///
+    /// `witness_id` is part of the object's identity (I-D §7.1: "A witness key object
+    /// additionally carries `witness_id`, the identity under which the manifest declares that
+    /// witness"), so the same key declared under a different identity is a different object.
+    fn witness_key_set(&self) -> BTreeSet<(String, String, String, u64)> {
+        self.witness_keys
+            .iter()
+            .map(|(witness_id, k)| {
+                (witness_id.clone(), k.key_id.clone(), k.pubkey.clone(), k.valid_from_index)
+            })
+            .collect()
+    }
+
+    /// Whether this manifest version is a GOVERNANCE-KEY ROTATION of `predecessor` (I-D §7.1):
+    /// "a manifest version whose LOG checkpoint-signing key objects OR whose WITNESS key
+    /// objects differ from those of its predecessor in the chain".
+    ///
+    /// Either set alone is enough, and the I-D says why: "either substitution defeats a
+    /// guarantee this document makes".
+    #[must_use]
+    pub fn rotates(&self, predecessor: &Self) -> bool {
+        self.log_key_set() != predecessor.log_key_set()
+            || self.witness_key_set() != predecessor.witness_key_set()
+    }
+
+    /// Whether this manifest version declares `key_id` as a witness key of `witness_id`,
+    /// active at `tree_size`.
+    ///
+    /// This is the membership question a witness asks of the OUTGOING state before cosigning
+    /// rotation material (I-D §7.1: at L3 a rotation proof's cosignature must verify "under a
+    /// witness key of the OUTGOING state"). A cosignature by a witness the retiring version
+    /// never declared attests nothing about the handover, so this witness does not produce
+    /// one.
+    #[must_use]
+    pub fn declares_witness(&self, witness_id: &str, key_id: &str, tree_size: u64) -> bool {
+        self.witness_keys.iter().any(|(declared_id, key)| {
+            declared_id == witness_id && key.key_id == key_id && key.valid_from_index <= tree_size
+        })
     }
 
     /// The `checkpoint_cadence` in force, as a nanosecond duration (core spec §7.3).
@@ -213,9 +276,32 @@ fn parse_governance(
         log_keys.push(ResolvedKeyObject::resolve(spec).ok()?);
     }
 
+    // The manifest's WITNESS key objects (core spec §6.2): who this version declares as a
+    // witness, and under which keys. A witness needs them for two things — I-D §7.1's
+    // governance-key-rotation test, which is over the log key objects OR the witness key
+    // objects, and its own membership in the OUTGOING set before it cosigns rotation material.
+    // The member is OPTIONAL — §6.2 requires it only at L3 — but where present it MUST parse
+    // and every key object in it MUST self-check, because treating a schema-invalid witness
+    // object as simply absent is how a witness-set rotation would escape the comparison.
+    let witness_keys = match payload.get("witnesses") {
+        None => Vec::new(),
+        Some(value) => {
+            let blocks: Vec<WitnessBlock> = serde_json::from_value(value.clone()).ok()?;
+            let mut resolved = Vec::new();
+            for block in &blocks {
+                for spec in &block.keys {
+                    resolved
+                        .push((block.witness_id.clone(), ResolvedKeyObject::resolve(spec).ok()?));
+                }
+            }
+            resolved
+        }
+    };
+
     Some(GovernanceState {
         producer_keys,
         log_keys,
+        witness_keys,
         cadence_nanos,
         cadence_epoch_nanos,
         witness_grace_period_nanos,
@@ -360,6 +446,23 @@ fn try_apply_key(
 /// Returns [`WitnessError::GovernanceChainUnresolvable`] if no verified genesis manifest is
 /// reached within `entries_prefix`.
 pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<GovernanceState> {
+    let tree_size = u64::try_from(entries_prefix.len())
+        .map_err(|_| WitnessError::IndexOverflow { what: "entries_prefix.len()" })?;
+    walk(entries_prefix, anchor, None)?
+        .ok_or(WitnessError::GovernanceChainUnresolvable { tree_size })
+}
+
+/// The one walk of `entries_prefix` both [`resolve`] and [`versions`] are views of.
+///
+/// `snapshots`, where given, collects the governance state as each manifest version leaves it —
+/// after phase 3, so a version that failed its checks contributes nothing. A `key` statement
+/// modifies the producer key set and never the log or witness key sets (core spec §2.4.6), so it
+/// is applied to the running state but starts no new version.
+fn walk(
+    entries_prefix: &[Vec<u8>],
+    anchor: &LogAnchor,
+    mut snapshots: Option<&mut Vec<GovernanceState>>,
+) -> WitnessResult<Option<GovernanceState>> {
     let mut state: Option<GovernanceState> = None;
     for (i, bytes) in entries_prefix.iter().enumerate() {
         let index =
@@ -368,7 +471,20 @@ pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<
         let Some(payload) = envelope.get("payload") else { continue };
         let Some(kind) = payload.get("type").and_then(Value::as_str) else { continue };
         match kind {
-            "manifest" => try_apply_manifest(&mut state, &envelope, payload, index, anchor)?,
+            "manifest" => {
+                let before = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                try_apply_manifest(&mut state, &envelope, payload, index, anchor)?;
+                let after = state.as_ref().map(GovernanceState::governing_manifest_entry_index);
+                // The governing index moves if and only if a version was actually installed: a
+                // candidate that failed selection, authentication or validation leaves it where
+                // it was, and two versions can never share an index.
+                if before != after {
+                    if let (Some(list), Some(current)) = (snapshots.as_deref_mut(), state.as_ref())
+                    {
+                        list.push(current.clone());
+                    }
+                }
+            }
             "key" => {
                 if let Some(current) = state.as_mut() {
                     try_apply_key(current, &envelope, payload, index)?;
@@ -377,9 +493,34 @@ pub fn resolve(entries_prefix: &[Vec<u8>], anchor: &LogAnchor) -> WitnessResult<
             _ => {}
         }
     }
+    Ok(state)
+}
+
+/// Every verified manifest VERSION in `entries_prefix`, in ascending entry-index order: the
+/// governance state as each one leaves it, beginning with the genesis manifest.
+///
+/// This is what a rotation search needs and [`resolve`] cannot give. I-D §7.1 defines a
+/// governance-key rotation by comparing a version against ITS PREDECESSOR IN THE CHAIN, and a
+/// `rotation_proofs[]` checkpoint's own active version may be "the rotating manifest or a later
+/// one" — so a checkpoint far past several rotations still has to be matched against each
+/// candidate rotation's own predecessor, not against the state at the end of the prefix.
+/// Consecutive elements here are exactly those (predecessor, rotating) pairs.
+///
+/// # Errors
+///
+/// As [`resolve`].
+pub fn versions(
+    entries_prefix: &[Vec<u8>],
+    anchor: &LogAnchor,
+) -> WitnessResult<Vec<GovernanceState>> {
     let tree_size = u64::try_from(entries_prefix.len())
         .map_err(|_| WitnessError::IndexOverflow { what: "entries_prefix.len()" })?;
-    state.ok_or(WitnessError::GovernanceChainUnresolvable { tree_size })
+    let mut collected = Vec::new();
+    walk(entries_prefix, anchor, Some(&mut collected))?;
+    if collected.is_empty() {
+        return Err(WitnessError::GovernanceChainUnresolvable { tree_size });
+    }
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -597,6 +738,91 @@ mod tests {
         assert_eq!(state.witness_grace_period_nanos(), 120_000_000_000);
         assert!(state.resolve_log_key(&rotated_log_key.key_id(), 1).is_ok());
         assert!(state.resolve_log_key(&log_key.key_id(), 1).is_err());
+    }
+
+    /// I-D §7.1: a governance-key rotation is a manifest version "whose LOG checkpoint-signing
+    /// key objects OR whose WITNESS key objects differ from those of its predecessor". Either
+    /// set alone, and the witness set is the half a log-key comparison alone would miss —
+    /// which for a witness is also the set that decides its own standing to attest a handover.
+    #[test]
+    fn a_manifest_replacing_only_the_witness_set_is_still_a_rotation() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"3a".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"3b".repeat(32)).expect("seed");
+        let witness_1 = ahl_core::TestKey::from_seed_hex("w1", &"3c".repeat(32)).expect("seed");
+        let witness_2 = ahl_core::TestKey::from_seed_hex("w2", &"3d".repeat(32)).expect("seed");
+        let witnesses = |key: &ahl_core::TestKey| json!([{ "witness_id": "witness-1", "keys": producer_key_array(key) }]);
+        let manifest = |witness: &ahl_core::TestKey, predecessor: Option<&str>| {
+            let mut payload = json!({
+                "type": "manifest",
+                "ahl_version": ahl_core::AHL_VERSION,
+                "producer": "producer-1",
+                "keys": producer_key_array(&producer),
+                "log": log_block(
+                    "sha256:aa", "PT5M", "2026-01-01T00:00:00Z", "PT1M",
+                    &producer_key_array(&log_key)
+                ),
+                "witnesses": witnesses(witness),
+            });
+            if let Some(predecessor) = predecessor {
+                payload["predecessor"] = json!(predecessor);
+            }
+            ahl_core::envelope(payload, &producer)
+        };
+
+        let genesis_env = manifest(&witness_1, None);
+        let genesis_id = entry_id_of(&genesis_env);
+        let anchor = anchor_with(&producer, &genesis_id);
+
+        // The LOG key set is untouched; only the witness key object changes.
+        let entries = vec![
+            ahl_core::jcs(&genesis_env),
+            ahl_core::jcs(&manifest(&witness_2, Some(&genesis_id))),
+        ];
+        let chain = versions(&entries, &anchor).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
+        assert_eq!(incoming.governing_manifest_entry_index(), 1);
+        assert_eq!(outgoing.governing_manifest_entry_index(), 0);
+        assert!(incoming.rotates(outgoing), "the witness key objects differ");
+        assert!(outgoing.declares_witness("witness-1", &witness_1.key_id(), 5));
+        assert!(!outgoing.declares_witness("witness-1", &witness_2.key_id(), 5));
+        assert!(!outgoing.declares_witness("witness-2", &witness_1.key_id(), 5));
+
+        // Re-declaring the SAME witness objects is not a rotation.
+        let entries = vec![
+            ahl_core::jcs(&genesis_env),
+            ahl_core::jcs(&manifest(&witness_1, Some(&genesis_id))),
+        ];
+        let chain = versions(&entries, &anchor).expect("valid successor");
+        let [outgoing, incoming] = chain.as_slice() else { panic!("two versions") };
+        assert!(!incoming.rotates(outgoing));
+    }
+
+    /// A `witnesses` member that is present but malformed makes the manifest invalid
+    /// governance, rather than being read as "no witnesses": treating it as absent is exactly
+    /// how a witness-set rotation would escape the comparison above.
+    #[test]
+    fn a_malformed_witnesses_member_is_not_governance() {
+        let producer =
+            ahl_core::TestKey::from_seed_hex("producer", &"3e".repeat(32)).expect("seed");
+        let log_key = ahl_core::TestKey::from_seed_hex("log", &"3f".repeat(32)).expect("seed");
+        let mut payload = json!({
+            "type": "manifest",
+            "ahl_version": ahl_core::AHL_VERSION,
+            "producer": "producer-1",
+            "keys": producer_key_array(&producer),
+            "log": log_block(
+                "sha256:aa", "PT5M", "2026-01-01T00:00:00Z", "PT1M",
+                &producer_key_array(&log_key)
+            ),
+        });
+        payload["witnesses"] = json!([{ "keys": producer_key_array(&log_key) }]);
+        let env = ahl_core::envelope(payload, &producer);
+        let anchor = anchor_with(&producer, &entry_id_of(&env));
+        assert!(matches!(
+            resolve(&[ahl_core::jcs(&env)], &anchor),
+            Err(WitnessError::GovernanceChainUnresolvable { .. })
+        ));
     }
 
     #[test]

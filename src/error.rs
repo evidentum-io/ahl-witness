@@ -173,6 +173,75 @@ pub enum WitnessError {
         tree_size: u64,
     },
 
+    /// A rotation cosignature is already held for this rotation at the same
+    /// `(tree_size, checkpoint_time)`, over a DIFFERENT checkpoint.
+    ///
+    /// Those four values do not identify a checkpoint — a log may sign one tree state at one
+    /// instant under two valid keys — so the row is compared in full and a genuine collision is
+    /// reported rather than silently overwriting a cosignature this witness already published.
+    #[error(
+        "a rotation cosignature for the manifest at entry index {manifest_entry_index} is \
+         already held at tree_size {tree_size}, {checkpoint_time}, over a different checkpoint"
+    )]
+    RotationCosignatureConflict {
+        /// The rotating manifest's entry index.
+        manifest_entry_index: u64,
+        /// The colliding `tree_size`.
+        tree_size: u64,
+        /// The colliding `checkpoint_time`.
+        checkpoint_time: String,
+    },
+
+    /// No rotation cosignature is held for the rotation anchored at this entry index.
+    #[error(
+        "no rotation cosignature is held for the manifest at entry index {manifest_entry_index}"
+    )]
+    UnknownRotationCosignature {
+        /// The requested rotating manifest's entry index.
+        manifest_entry_index: u64,
+    },
+
+    /// A checkpoint that did not verify under the state active for its own `tree_size` is
+    /// not ROTATION-ANCHORING material either, so I-D §7.1's transition exception does not
+    /// reach it.
+    ///
+    /// Never the error a submission is refused with: the exception is a second chance, so a
+    /// checkpoint that fails it is reported with the failure it earned under the ordinary rule
+    /// (see [`crate::witness::witness_checkpoint`]). This variant names why the second chance
+    /// did not apply, for the caller that asks the classification directly.
+    #[error(
+        "checkpoint at tree_size {tree_size} is not rotation-anchoring material for the \
+         manifest at entry index {manifest_entry_index}: {reason}"
+    )]
+    NotRotationMaterial {
+        /// The submitted checkpoint's `tree_size`.
+        tree_size: u64,
+        /// The entry index of the manifest version active for that `tree_size`.
+        manifest_entry_index: u64,
+        /// Which condition of I-D §7.1 was not met.
+        reason: &'static str,
+    },
+
+    /// This witness is not declared by the OUTGOING manifest version, so it has no standing to
+    /// attest that version's handover (I-D §7.1: a rotation proof's cosignature must verify
+    /// "under a witness key of the OUTGOING state").
+    ///
+    /// A refusal to produce a cosignature that could never satisfy the rule it exists for —
+    /// not refusal evidence, which §11.2 reserves for two validly signed conflicting
+    /// checkpoints.
+    #[error(
+        "witness `{witness_id}` with key `{key_id}` is not declared by the manifest version \
+         preceding entry index {manifest_entry_index}, so it cannot attest that rotation"
+    )]
+    WitnessNotInOutgoingSet {
+        /// This witness's declared identity.
+        witness_id: String,
+        /// This witness's signing key id.
+        key_id: String,
+        /// The entry index of the rotating manifest.
+        manifest_entry_index: u64,
+    },
+
     /// A checkpoint's signature does not verify against its resolved key.
     #[error("checkpoint signature does not verify against key `{key_id}`")]
     SignatureInvalid {

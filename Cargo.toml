@@ -1,11 +1,12 @@
 [package]
 name = "ahl-witness"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "Independent AHL witness: §3.3 cosigning state machine for the ahl-adaptor-atl-v1 profile"
 repository = "https://github.com/evidentum-io/ahl-witness"
+homepage = "https://ahl-protocol.org"
 readme = "README.md"
 categories = ["cryptography", "data-structures"]
 keywords = ["provenance", "transparency-log", "merkle-tree", "ahl"]
@@ -35,12 +36,12 @@ todo = "deny"
 unimplemented = "deny"
 missing_panics_doc = "deny"
 # See ahl-core Cargo.toml for the rationale: thiserror 1.x (pulled in directly and via the
-# pinned atl-core revision) resolves against both syn 2.x and syn 3.x transitively.
+# registry `atl-core`) resolves against both syn 2.x and syn 3.x transitively.
 multiple_crate_versions = "allow"
 
 [dependencies]
-ahl-core = { version = "0.4.0", path = "../ahl-core" }
-atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+ahl-core = "0.5.0"
+atl-core = { version = "=0.23.2", default-features = false }
 axum = "0.8.9"
 base64 = "0.22"
 clap = { version = "4.6.6", features = ["derive"] }

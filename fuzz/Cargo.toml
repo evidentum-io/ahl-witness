@@ -15,10 +15,10 @@ serde_json = "1"
 base64 = "0.22"
 ed25519-dalek = "2"
 hex = "0.4"
-ahl-core = { path = "../../ahl-core" }
-# The same pinned revision the library uses, so cargo unifies them and the fixture roots this
+ahl-core = "0.5.0"
+# The same registry version the library uses, so cargo unifies them and the fixture roots this
 # crate computes are the roots the library computes.
-atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+atl-core = { version = "=0.23.2", default-features = false }
 
 [dependencies.ahl-witness]
 path = ".."
